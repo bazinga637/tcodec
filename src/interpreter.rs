@@ -18,7 +18,8 @@ pub struct Interpreter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeValue {
-    Number(f64),
+    Int(i32),
+    Float(f64),
     String(String),
     Boolean(bool),
     Array(Rc<RefCell<Vec<RuntimeValue>>>),
@@ -68,6 +69,19 @@ impl Interpreter {
     }
 
     pub fn run(&mut self) -> Result<(), String> {
+        trait ToF64 {
+            fn to_f64(&self) -> Option<f64>;
+        }
+        impl ToF64 for RuntimeValue {
+            fn to_f64(&self) -> Option<f64> {
+                match self {
+                    RuntimeValue::Int(n) => Some(*n as f64),
+                    RuntimeValue::Float(n) => Some(*n),
+                    _ => None,
+                }
+            }
+        }
+
         while self.ip < self.bytecode.len() {
             let op = self.bytecode[self.ip].clone();
             self.ip += 1;
@@ -75,7 +89,8 @@ impl Interpreter {
             match op {
                 OpCode::LineUpdate(span) => self.current_span = span,
 
-                OpCode::PushNumber(n) => self.stack.push(RuntimeValue::Number(n)),
+                OpCode::PushInt(n) => self.stack.push(RuntimeValue::Int(n)),
+                OpCode::PushFloat(n) => self.stack.push(RuntimeValue::Float(n)),
                 OpCode::PushString(s) => self.stack.push(RuntimeValue::String(s)),
                 OpCode::PushBoolean(b) => self.stack.push(RuntimeValue::Boolean(b)),
                 OpCode::PushNil => self.stack.push(RuntimeValue::Nil),
@@ -99,24 +114,108 @@ impl Interpreter {
                     current_frame.locals[slot] = val;
                 }
 
+                OpCode::GetIndex => {
+                    let index_val = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing index operand")?;
+                    let target = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing target operand")?;
+
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Index must be an <int>.");
+                    };
+
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+
+                    match target {
+                        RuntimeValue::Array(list_ptr) => {
+                            let list = list_ptr.borrow();
+                            if idx >= list.len() {
+                                return error!(
+                                    "Runtime Error: <array> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    list.len()
+                                );
+                            }
+                            self.stack.push(list[idx].clone());
+                        }
+                        RuntimeValue::String(s) => {
+                            if let Some(ch) = s.chars().nth(idx) {
+                                self.stack.push(RuntimeValue::String(ch.to_string()));
+                            } else {
+                                return error!(
+                                    "Runtime Error: <string> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    s.chars().count()
+                                );
+                            }
+                        }
+                        _ => return error!("Runtime Error: Cannot index into this type."),
+                    }
+                }
+
+                OpCode::SetIndex => {
+                    let value = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing value for index assignment")?;
+                    let index_val = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing index for index assignment")?;
+                    let target = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing target for index assignment")?;
+
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Array index must be an <int>.");
+                    };
+
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+
+                    match target {
+                        RuntimeValue::Array(list_ptr) => {
+                            let mut list = list_ptr.borrow_mut();
+                            if idx >= list.len() {
+                                return error!(
+                                    "Runtime Error: <array> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    list.len()
+                                );
+                            }
+                            list[idx] = value;
+                        }
+                        _ => {
+                            return error!(
+                            "Runtime Error: Index assignment is only supported on <array> types."
+                        )
+                        }
+                    }
+                }
+
                 OpCode::Pop => {
                     self.stack
                         .pop()
                         .ok_or("Interpreter Error: Pop stack underflow")?;
-                }
-
-                OpCode::Negate => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or("Interpreter Error: Negate operand missing")?;
-                    if let RuntimeValue::Number(n) = val {
-                        self.stack.push(RuntimeValue::Number(-n));
-                    } else {
-                        return error!(
-                            "Runtime Error: Negation (-) can only be applied to numeric type values.",
-                        );
-                    }
                 }
 
                 OpCode::Not => {
@@ -133,6 +232,22 @@ impl Interpreter {
                     }
                 }
 
+                OpCode::Negate => {
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Negate operand missing")?;
+                    match val {
+                        RuntimeValue::Int(n) => self.stack.push(RuntimeValue::Int(-n)),
+                        RuntimeValue::Float(n) => self.stack.push(RuntimeValue::Float(-n)),
+                        _ => {
+                            return error!(
+                            "Runtime Error: Negation (-) can only be applied to numeric values."
+                        )
+                        }
+                    }
+                }
+
                 OpCode::Add => {
                     let r = self
                         .stack
@@ -142,10 +257,18 @@ impl Interpreter {
                         .stack
                         .pop()
                         .ok_or("Interpreter Error: Add left operand missing")?;
-
                     match (l, r) {
-                        (RuntimeValue::Number(a), RuntimeValue::Number(b)) => {
-                            self.stack.push(RuntimeValue::Number(a + b));
+                        (RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            self.stack.push(RuntimeValue::Int(a + b))
+                        }
+                        (RuntimeValue::Float(a), RuntimeValue::Float(b)) => {
+                            self.stack.push(RuntimeValue::Float(a + b))
+                        }
+                        (RuntimeValue::Int(a), RuntimeValue::Float(b)) => {
+                            self.stack.push(RuntimeValue::Float(a as f64 + b))
+                        }
+                        (RuntimeValue::Float(a), RuntimeValue::Int(b)) => {
+                            self.stack.push(RuntimeValue::Float(a + b as f64))
                         }
                         (RuntimeValue::String(mut a), RuntimeValue::String(b)) => {
                             a.push_str(&b);
@@ -153,8 +276,8 @@ impl Interpreter {
                         }
                         _ => {
                             return error!(
-                                "Runtime Error: Invalid operand types profile for binary addition (+) operation.",
-                            );
+                                "Runtime Error: Invalid operand profiles for binary addition (+)."
+                            )
                         }
                     }
                 }
@@ -162,43 +285,99 @@ impl Interpreter {
                 OpCode::Sub => {
                     let r = self.stack.pop().unwrap();
                     let l = self.stack.pop().unwrap();
-                    if let (RuntimeValue::Number(a), RuntimeValue::Number(b)) = (l, r) {
-                        self.stack.push(RuntimeValue::Number(a - b));
+                    match (l, r) {
+                        (RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            self.stack.push(RuntimeValue::Int(a - b))
+                        }
+                        (RuntimeValue::Float(a), RuntimeValue::Float(b)) => {
+                            self.stack.push(RuntimeValue::Float(a - b))
+                        }
+                        (RuntimeValue::Int(a), RuntimeValue::Float(b)) => {
+                            self.stack.push(RuntimeValue::Float(a as f64 - b))
+                        }
+                        (RuntimeValue::Float(a), RuntimeValue::Int(b)) => {
+                            self.stack.push(RuntimeValue::Float(a - b as f64))
+                        }
+                        _ => {
+                            return error!(
+                            "Runtime Error: Invalid operand profiles for binary subtraction (-)."
+                        )
+                        }
                     }
                 }
 
                 OpCode::Mul => {
                     let r = self.stack.pop().unwrap();
                     let l = self.stack.pop().unwrap();
-                    if let (RuntimeValue::Number(a), RuntimeValue::Number(b)) = (l, r) {
-                        self.stack.push(RuntimeValue::Number(a * b));
+                    match (l, r) {
+                        (RuntimeValue::Int(a), RuntimeValue::Int(b)) => self.stack.push(RuntimeValue::Int(a * b)),
+                        (RuntimeValue::Float(a), RuntimeValue::Float(b)) => self.stack.push(RuntimeValue::Float(a * b)),
+                        (RuntimeValue::Int(a), RuntimeValue::Float(b)) => self.stack.push(RuntimeValue::Float(a as f64 * b)),
+                        (RuntimeValue::Float(a), RuntimeValue::Int(b)) => self.stack.push(RuntimeValue::Float(a * b as f64)),
+                        _ => return error!("Runtime Error: Invalid operand profiles for binary multiplication (*)."),
                     }
                 }
 
                 OpCode::Div => {
                     let r = self.stack.pop().unwrap();
                     let l = self.stack.pop().unwrap();
-                    if let (RuntimeValue::Number(a), RuntimeValue::Number(b)) = (l, r) {
+                    if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
                         if b == 0.0 {
-                            return error!("Runtime Error: Division by zero");
+                            return error!("Runtime Error: Division by zero.");
                         }
-                        self.stack.push(RuntimeValue::Number(a / b));
+                        if let (RuntimeValue::Int(ai), RuntimeValue::Int(bi)) = (&l, &r) {
+                            if ai % bi == 0 {
+                                self.stack.push(RuntimeValue::Int(ai / bi));
+                            } else {
+                                self.stack.push(RuntimeValue::Float(a / b));
+                            }
+                        } else {
+                            self.stack.push(RuntimeValue::Float(a / b));
+                        }
+                    } else {
+                        return error!(
+                            "Runtime Error: Invalid operand profiles for binary division (/)."
+                        );
                     }
                 }
 
                 OpCode::LessThan => {
                     let r = self.stack.pop().unwrap();
                     let l = self.stack.pop().unwrap();
-                    if let (RuntimeValue::Number(a), RuntimeValue::Number(b)) = (l, r) {
+                    if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
                         self.stack.push(RuntimeValue::Boolean(a < b));
+                    } else {
+                        return error!("Runtime Error: Comparisons demand numeric arguments.");
                     }
                 }
 
                 OpCode::GreaterThan => {
                     let r = self.stack.pop().unwrap();
                     let l = self.stack.pop().unwrap();
-                    if let (RuntimeValue::Number(a), RuntimeValue::Number(b)) = (l, r) {
+                    if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
                         self.stack.push(RuntimeValue::Boolean(a > b));
+                    } else {
+                        return error!("Runtime Error: Comparisons demand numeric arguments.");
+                    }
+                }
+
+                OpCode::LessEqual => {
+                    let r = self.stack.pop().unwrap();
+                    let l = self.stack.pop().unwrap();
+                    if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                        self.stack.push(RuntimeValue::Boolean(a <= b));
+                    } else {
+                        return error!("Runtime Error: Comparisons demand numeric arguments.");
+                    }
+                }
+
+                OpCode::GreaterEqual => {
+                    let r = self.stack.pop().unwrap();
+                    let l = self.stack.pop().unwrap();
+                    if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                        self.stack.push(RuntimeValue::Boolean(a >= b));
+                    } else {
+                        return error!("Runtime Error: Comparisons demand numeric arguments.");
                     }
                 }
 
@@ -256,7 +435,7 @@ impl Interpreter {
                         .ok_or("Interpreter Error: Or left operand missing")?;
 
                     if let (RuntimeValue::Boolean(a), RuntimeValue::Boolean(b)) = (l, r) {
-                        self.stack.push(RuntimeValue::Boolean(a && b));
+                        self.stack.push(RuntimeValue::Boolean(a || b));
                     } else {
                         return error!(
                             "Runtime Error: OR (||) can only be applied to boolean values.",

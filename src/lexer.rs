@@ -197,6 +197,17 @@ impl Lexer {
 
             // handle symbols
             if symbols.contains(&c) {
+                if c == '.'
+                    && !current_str.is_empty()
+                    && current_str.chars().all(|ch| ch.is_ascii_digit())
+                    && self
+                        .peek_next()
+                        .is_some_and(|next_c| next_c.is_ascii_digit())
+                {
+                    current_str.push(self.advance().unwrap());
+                    continue;
+                }
+
                 if !current_str.is_empty() {
                     tokens.push(Token {
                         value: current_str.clone(),

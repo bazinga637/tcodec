@@ -18,139 +18,170 @@ mod nativemthds;
 
 use std::env;
 use std::fs;
-
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
+
+// central error type for compiler and interpreter
+enum AppError {
+    MissingFilename,
+    FileNotFound(String),
+    FileReadFailed(String),
+    NoMainFunction,
+    RuntimeError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    TypeError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+}
 
 fn main() {
     let _ = File::create(".log"); // wipes log file after each run
 
-    // collect all command-line arguments passed to the program
     let args: Vec<String> = env::args().collect();
-
     let mut target_filename = None;
+
+    let mut do_bytecode = false;
 
     for arg in args.iter().skip(1) {
         match arg.as_str() {
-            "--test" => (),
-
+            "--bytecode" => do_bytecode = true,
             _ => {
-                // If it doesn't look like a flag, treat it as our source code filename
                 if target_filename.is_none() {
                     target_filename = Some(arg);
                 }
             }
         }
     }
-    // check if a filename was actually provided
-    // args[0] is always the path to the generator executable itself.
-    // args[1] will be the user's input file path.
-    let target_filename = match target_filename {
-        Some(filename) => filename,
-        None => {
-            println!("Usage: tcodec [FLAGS] <filename.tc>");
-            println!("\nFlags:");
-            println!("  I aint got any yet");
-            std::process::exit(1); // Stop execution early if filename is missing
-        }
-    };
 
+    // Execute the compiler pipeline and catch any returned errors
+    if let Err(err) = run_pipeline(target_filename, do_bytecode) {
+        handle_error(err);
+        std::process::exit(1);
+    }
+}
+
+// Moves processing logic out of main to cleanly use the ? operator with AppError
+fn run_pipeline(target_filename: Option<&String>, do_bytecode: bool) -> Result<(), AppError> {
+    let target_filename = target_filename.ok_or(AppError::MissingFilename)?;
     let file_path = Path::new(target_filename);
 
     if !file_path.exists() {
-        eprintln!(
-            "[ ERR ] The specified file '{}' does not exist.",
-            file_path.display()
-        );
-        std::process::exit(1);
+        return Err(AppError::FileNotFound(file_path.display().to_string()));
     }
 
-    print_info_before(&format!("Getting source code from {}", file_path.display()));
     let source_code = fs::read_to_string(target_filename)
-        .unwrap_or_else(|_| panic!("Failed to read the file: {}", file_path.display()));
-    print_info_after("Getting source code", None);
+        .map_err(|_| AppError::FileReadFailed(file_path.display().to_string()))?;
     let _ = log(&source_code);
 
     let lexer = Lexer::new(source_code);
     let tokens = lexer.lex();
-    print_info_after("Tokenizing source code", None);
-
     let _ = log(&tokens);
 
-    print_info_before("Parsing tokens");
     let mut parser: Parser = Parser::new(tokens);
     let ast: parser::Program = parser.parse_program();
-    print_info_after("Parsing tokens", None);
-
     let _ = log(&ast);
 
-    print_info_before("Running Type Verification Pass");
-    TypeChecker::check(&ast); // Enforces type checks! Halts if it finds violations.
-    print_info_after("Type Verification Pass", None);
+    TypeChecker::check(&ast)?; // Enforces type checks! Halts and bubbles out if it finds violations.
 
-    print_info_before("Generating Bytecode from AST");
     let (bytecode, user_functions) = Generator::compile(&ast);
-    print_info_after("Generating Bytecode from AST", None);
-
     let _ = log(&bytecode);
+
+    if do_bytecode {
+        println!("{:?}", bytecode);
+    }
 
     let native_functions = nativefns::get_native_registry();
     let native_methods = nativemthds::get_native_method_registry();
 
-    println!("Executing program...");
-    // pass the registry map straight into the Interpreter
     let mut interpreter =
         Interpreter::new(bytecode, native_functions, native_methods, user_functions);
 
     if let Some(&main_address) = interpreter.user_functions.get("main") {
         interpreter.ip = main_address; // makes the VM start at 'main' function
     } else {
-        panic!("Runtime Error: No 'main' function was found in the compiled TCode program.");
+        return Err(AppError::NoMainFunction);
     }
 
-    match interpreter.run() {
-        Ok(_) => println!("[ OK! ] Program execution completed successfully."),
+    if let Err(error_message) = interpreter.run() {
+        let span = interpreter.current_span;
+        return Err(AppError::RuntimeError {
+            line: span.line,
+            column: span.column,
+            message: error_message,
+        });
+    }
+    Ok(())
+}
 
-        Err(error_message) => {
-            let span = interpreter.current_span;
+fn handle_error(err: AppError) {
+    match err {
+        AppError::MissingFilename => {
+            println!("Usage: tcodec [FLAGS] <filename.tc>");
+            println!("\nFlags:");
+            println!("  --bytecode to print generated bytecode");
+        }
+        AppError::FileNotFound(path) => {
             eprintln!(
-                "\x1B[1;31mRuntime Error [Line {}, Col {}]:\x1B[0m {}",
-                span.line, span.column, error_message
+                "\x1B[1;31m[ ERR ]\x1B[0m The specified file '{}' does not exist.",
+                path
             );
-            std::process::exit(1);
+        }
+        AppError::FileReadFailed(path) => {
+            eprintln!("\x1B[1;31m[ ERR ]\x1B[0m Failed to read the file: {}", path);
+        }
+        AppError::NoMainFunction => {
+            print_info_after(
+                "Executing Program",
+                Some("Runtime Error: No 'main' function was found in the compiled program."),
+            );
+        }
+        AppError::RuntimeError {
+            line,
+            column,
+            message,
+        } => {
+            let error_msg = format!("Runtime Error [Line {}, Col {}]: {}", line, column, message);
+            print_info_after("Executing Program", Some(&error_msg));
+        }
+        AppError::TypeError {
+            line,
+            column,
+            message,
+        } => {
+            let error_msg = format!("Type Error [Line {}, Col {}]: {}", line, column, message);
+            print_info_after("Type Verification Pass", Some(&error_msg));
         }
     }
 }
-
+/*
 fn print_info_before(process: &str) {
     println!("[     ] {process}...")
 }
+*/
+fn print_info_after(process: &str, error: Option<&str>) {
+    print!("\x1B[1A\x1B[2K"); // removes previous line so it can be rewritten
 
-fn print_info_after(process: &str, error: Option<std::io::Error>) {
-    print!("\x1B[1A\x1B[2K"); //removes previous line so it can be rewritten
-
-    // rewrites line based on if there is an error or not
     match error {
-        Some(err) => println!("[ ERR ] {process} FAILED!     \n{err}"),
-
+        Some(err) => println!("\x1B[1;31m[ ERR ]\x1B[0m {process} FAILED!     \n{err}"),
         None => println!("[ OK! ] {process} DONE!   "),
     };
 
     std::io::stdout().flush().unwrap(); // updates terminal to show edited lines
 }
 
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Write;
-
 fn log<T: std::fmt::Debug>(content: &T) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .append(true) // Sets append mode
         .open(".log")?;
 
-    // makes newlines actually appear instead of showing "\n"
     let clean_content = format!("{:#?}", content).replace("\\n", "\n");
-
     file.write_all(clean_content.as_bytes())?; // writes to log file
-
     Ok(()) // closes file
 }

@@ -8,21 +8,30 @@ use std::rc::Rc;
 pub type NativeFn = fn(args: &[RuntimeValue]) -> RuntimeValue;
 
 pub fn get_native_registry() -> HashMap<String, NativeFn> {
-    // registry of functions, includes the name, then function
     let mut registry: HashMap<String, NativeFn> = HashMap::new();
 
-    registry.insert("print".to_string(), native_print);
-    registry.insert("readline".to_string(), native_readline);
-    registry.insert("len".to_string(), native_len);
-    registry.insert("split".to_string(), native_split);
-    registry.insert("to_number".to_string(), native_to_number);
-    registry.insert("panic".to_string(), native_panic);
-    registry.insert("type".to_string(), native_type);
-    registry.insert("range".to_string(), native_range);
-    registry.insert("assert".to_string(), native_assert);
-    registry.insert("exit".to_string(), native_exit);
-    registry.insert("chr".to_string(), native_chr);
-    registry.insert("ord".to_string(), native_ord);
+    macro_rules! register {
+        ($($name:expr => $func:expr),* $(,)?) => {
+            $( registry.insert($name.to_string(), $func); )*
+        };
+    }
+
+    register! {
+        "print" => native_print,
+        "readline" => native_readline,
+        "len" => native_len,
+        "split" => native_split,
+        "to_number" => native_to_number,
+        "panic" => native_panic,
+        "type" => native_type,
+        "range" => native_range,
+        "assert" => native_assert,
+        "exit" => native_exit,
+        "chr" => native_chr,
+        "ord" => native_ord,
+        "randint" => native_randint,
+        "randflt" => native_randflt,
+    }
 
     registry
 }
@@ -30,7 +39,7 @@ pub fn get_native_registry() -> HashMap<String, NativeFn> {
 // turns any list of printable arguments into a RuntimeValue::Error()
 macro_rules! error {
     ($first:expr $(, $extra:expr)* $(,)?) => {{
-        let err = $first.to_string();
+        let err = format!("Runtime Error: {}", $first);
         $(
             let err = format!("{}{}", err, $extra);
         )*
@@ -41,7 +50,8 @@ macro_rules! error {
 // defines how to handle print() as a native function
 fn stringify_value(val: &RuntimeValue) -> String {
     match val {
-        RuntimeValue::Number(n) => n.to_string(),
+        RuntimeValue::Int(n) => n.to_string(),
+        RuntimeValue::Float(n) => n.to_string(),
         RuntimeValue::String(s) => s.clone(),
         RuntimeValue::Boolean(b) => b.to_string(),
         RuntimeValue::Nil => "nil".to_string(),
@@ -99,19 +109,18 @@ fn native_readline(_args: &[RuntimeValue]) -> RuntimeValue {
     }
 }
 
-// defines len() as a native function
 fn native_len(args: &[RuntimeValue]) -> RuntimeValue {
     match args.first() {
-        Some(RuntimeValue::Array(list_ptr)) => RuntimeValue::Number(list_ptr.borrow().len() as f64),
-        Some(RuntimeValue::String(s)) => RuntimeValue::Number(s.len() as f64),
-        _ => error!("Runtime Error: len() expects an array or string argument."),
+        Some(RuntimeValue::Array(list_ptr)) => RuntimeValue::Int(list_ptr.borrow().len() as i32),
+        Some(RuntimeValue::String(s)) => RuntimeValue::Int(s.len() as i32),
+        _ => error!("Function 'len()' expects an <array> or <string> argument."),
     }
 }
 
 fn native_split(args: &[RuntimeValue]) -> RuntimeValue {
     // split expects 2 arguments: split("target_string", "delimiter")
     if args.len() < 2 {
-        error!("Runtime Error: split() expects exactly 2 arguments (string, delimiter).");
+        return error!("Function 'split()' expects exactly 2 arguments (<string>, <string>).");
     }
 
     match (&args[0], &args[1]) {
@@ -122,18 +131,18 @@ fn native_split(args: &[RuntimeValue]) -> RuntimeValue {
                 .map(|s| RuntimeValue::String(s.to_string()))
                 .collect();
 
-            // Wrap the vector in your upgraded Rc<RefCell<...>> type matching the VM
             RuntimeValue::Array(Rc::new(RefCell::new(segments)))
         }
+
         (RuntimeValue::String(_), _) => {
-            error!("Runtime Error: Second argument of split() must also be a string.")
+            error!("Second argument of function 'split()' must be a <string> type.")
         }
 
         (_, RuntimeValue::String(_)) => {
-            error!("Runtime Error: First argument of split() must also be a string")
+            error!("First argument of function 'split()' must be a <string> type.")
         }
 
-        _ => error!("Runtime Error: Both arguments to split() must be strings."),
+        _ => error!("Both arguments of function 'split()' must be <string> types."),
     }
 }
 
@@ -142,60 +151,68 @@ fn native_to_number(args: &[RuntimeValue]) -> RuntimeValue {
         Some(RuntimeValue::String(s)) => {
             // Attempt to parse the string into an f64 float number
             match s.parse::<f64>() {
-                Ok(num) => RuntimeValue::Number(num),
+                Ok(num) => {
+                    if num.fract() == 0.0 {
+                        RuntimeValue::Int(num as i32)
+                    } else {
+                        RuntimeValue::Float(num)
+                    }
+                }
                 Err(_) => {
-                    // Fallback option: if parsing fails (e.g. to_number("abc")), return 0.0 or Nil
-                    RuntimeValue::Number(0.0)
+                    // if parsing fails (e.g. to_number("abc")), return
+                    RuntimeValue::Int(0)
                 }
             }
         }
-        Some(RuntimeValue::Number(n)) => RuntimeValue::Number(*n), // Already a number, return it
+        Some(RuntimeValue::Int(n)) => RuntimeValue::Int(*n), // Already a number, return it
+        Some(RuntimeValue::Float(n)) => RuntimeValue::Float(*n), // Already a number, return it
 
-        _ => error!("Runtime Error: to_number() expects a string or number argument."),
+        _ => error!("Function 'to_number()' expects an argument of <string> or <number> type."),
     }
 }
 
 fn native_panic(args: &[RuntimeValue]) -> RuntimeValue {
     if let Some(RuntimeValue::String(msg)) = args.first() {
-        error!("User Panic: ", msg)
+        error!("Panic - ", msg)
     } else {
-        error!("User Panic: (No error message provided)")
+        error!("Panic - (No error message provided)")
     }
 }
 
 fn native_type(args: &[RuntimeValue]) -> RuntimeValue {
     match args.first() {
-        Some(RuntimeValue::Number(_)) => RuntimeValue::String("number".to_string()),
+        Some(RuntimeValue::Int(_)) => RuntimeValue::String("int".to_string()),
+        Some(RuntimeValue::Float(_)) => RuntimeValue::String("float".to_string()),
         Some(RuntimeValue::String(_)) => RuntimeValue::String("string".to_string()),
         Some(RuntimeValue::Boolean(_)) => RuntimeValue::String("boolean".to_string()),
         Some(RuntimeValue::Array(_)) => RuntimeValue::String("array".to_string()),
         Some(RuntimeValue::Nil) => RuntimeValue::String("nil".to_string()),
         Some(RuntimeValue::Error(_)) => RuntimeValue::String("error".to_string()),
-        None => error!("Runtime Error: type() expects 1 argument, found 0."),
+        None => error!("Runtime Error: Function 'type()' expects 1 argument, found 0."),
     }
 }
 
 fn native_range(args: &[RuntimeValue]) -> RuntimeValue {
     if args.len() < 2 {
-        return error!("Runtime Error: range() expects exactly 2 numeric arguments (start, end).");
+        return error!("Function 'range()' expects exactly 2 numeric arguments (start, end).");
     }
     match (&args[0], &args[1]) {
-        (RuntimeValue::Number(start), RuntimeValue::Number(end)) => {
+        (RuntimeValue::Int(start), RuntimeValue::Int(end)) => {
             let mut list = Vec::new();
             let mut current = *start;
             while current < *end {
-                list.push(RuntimeValue::Number(current));
-                current += 1.0;
+                list.push(RuntimeValue::Int(current));
+                current += 1;
             }
             RuntimeValue::Array(Rc::new(RefCell::new(list)))
         }
-        _ => error!("Runtime Error: Arguments to range() must be numbers."),
+        _ => error!("Arguments to function 'range()' must be <number> types."),
     }
 }
 
 fn native_assert(args: &[RuntimeValue]) -> RuntimeValue {
     if args.is_empty() {
-        return error!("Runtime Error: assert() expects at least a boolean condition argument.");
+        return error!("Function 'assert()' expects at least 1 <bool> type argument.");
     }
     let assertion_passed = match &args[0] {
         RuntimeValue::Boolean(b) => *b,
@@ -204,9 +221,9 @@ fn native_assert(args: &[RuntimeValue]) -> RuntimeValue {
     };
     if !assertion_passed {
         if let Some(RuntimeValue::String(custom_msg)) = args.get(1) {
-            error!("Assertion Failure: ", custom_msg)
+            error!("Assertion failed - ", custom_msg)
         } else {
-            error!("Assertion Failure: Condition evaluated to false.")
+            error!("Assertion failed - Condition evaluated to false.")
         }
     } else {
         RuntimeValue::Nil
@@ -215,7 +232,7 @@ fn native_assert(args: &[RuntimeValue]) -> RuntimeValue {
 
 fn native_exit(args: &[RuntimeValue]) -> RuntimeValue {
     let exit_code = match args.first() {
-        Some(RuntimeValue::Number(n)) => *n as i32,
+        Some(RuntimeValue::Int(n)) => *n,
         _ => 0,
     };
     std::process::exit(exit_code);
@@ -223,17 +240,17 @@ fn native_exit(args: &[RuntimeValue]) -> RuntimeValue {
 
 fn native_chr(args: &[RuntimeValue]) -> RuntimeValue {
     match args.first() {
-        Some(RuntimeValue::Number(n)) => {
+        Some(RuntimeValue::Int(n)) => {
             let code = *n as u32;
             match char::from_u32(code) {
                 Some(c) => RuntimeValue::String(c.to_string()),
                 None => error!(
-                    "Runtime Error: chr() integer value ",
+                    "Function 'chr()' value ",
                     code, " is not a valid Unicode scalar."
                 ),
             }
         }
-        _ => error!("Runtime Error: chr() expects a numeric Unicode integer argument."),
+        _ => error!("Function 'chr()' expects a Unicode <int> type argument."),
     }
 }
 
@@ -241,11 +258,75 @@ fn native_ord(args: &[RuntimeValue]) -> RuntimeValue {
     match args.first() {
         Some(RuntimeValue::String(s)) => {
             if let Some(c) = s.chars().next() {
-                RuntimeValue::Number(c as u32 as f64)
+                RuntimeValue::Int(c as u32 as i32)
             } else {
-                error!("Runtime Error: ord() cannot read an empty string layout frame.")
+                error!("Function 'ord()' cannot read an empty <string> layout frame.")
             }
         }
-        _ => error!("Runtime Error: ord() expects a valid string context argument."),
+        _ => error!("Function 'ord()' expects a valid <string> context argument."),
+    }
+}
+
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+
+// Helper to generate a raw random u64 using std's OS-seeded RandomState
+fn next_random_u64() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
+fn native_randint(args: &[RuntimeValue]) -> RuntimeValue {
+    if args.len() < 2 {
+        return error!("Function 'randint()' expects 2 <int> arguments (min, max).");
+    }
+
+    match (&args[0], &args[1]) {
+        (RuntimeValue::Int(min), RuntimeValue::Int(max)) => {
+            if min > max {
+                return error!("Function 'randint()' min value cannot be greater than max value.");
+            }
+            // Inclusive range [min, max]
+            let span = (*max as i64 - *min as i64 + 1) as u64;
+            let offset = (next_random_u64() % span) as i64;
+            RuntimeValue::Int((*min as i64 + offset) as i32)
+        }
+        _ => error!("Arguments to function 'randint()' must be <int> types."),
+    }
+}
+
+fn native_randflt(args: &[RuntimeValue]) -> RuntimeValue {
+    match args.len() {
+        // randflt() with 0 arguments -> returns a float in [0.0, 1.0)
+        0 => {
+            let val = (next_random_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+            RuntimeValue::Float(val)
+        }
+        // randflt(min, max) with 2 arguments -> returns a float in [min, max)
+        2 => match (&args[0], &args[1]) {
+            (RuntimeValue::Float(min), RuntimeValue::Float(max)) => {
+                if min > max {
+                    return error!(
+                        "Function 'randflt()' min value cannot be greater than max value."
+                    );
+                }
+                let unit = (next_random_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+                RuntimeValue::Float(min + unit * (max - min))
+            }
+            // Also allow Int bounds (e.g., randflt(1, 5))
+            (RuntimeValue::Int(min), RuntimeValue::Int(max)) => {
+                let (min_f, max_f) = (*min as f64, *max as f64);
+                if min_f > max_f {
+                    return error!(
+                        "Function 'randflt()' min value cannot be greater than max value."
+                    );
+                }
+                let unit = (next_random_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+                RuntimeValue::Float(min_f + unit * (max_f - min_f))
+            }
+            _ => error!("Arguments to function 'randflt()' must be <number> types."),
+        },
+        _ => error!(
+            "Function 'randflt()' expects either 0 arguments or 2 <number> arguments (min, max)."
+        ),
     }
 }

@@ -14,6 +14,12 @@ pub enum Statement {
         value: ExpressionNode,
     },
 
+    IndexAssignment {
+        target: ExpressionNode,
+        index: ExpressionNode,
+        value: ExpressionNode,
+    },
+
     // if cond { then } else { else }
     If {
         condition: ExpressionNode,
@@ -99,11 +105,17 @@ pub enum Expression {
         callee: Box<ExpressionNode>,
         arguments: Vec<ExpressionNode>,
     },
+
+    Index {
+        object: Box<ExpressionNode>,
+        index: Box<ExpressionNode>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum LiteralValue {
-    Number(f64),
+    Int(i32),
+    Float(f64),
     String(String),
     Boolean(bool),
     Nil, // Represents null/none
@@ -306,6 +318,8 @@ impl Parser {
 
         let target = self.parse(); // Parse the evaluation expression target
 
+        assert!(self.match_token("{"), "Expected '{{' to open match block");
+
         let mut cases = Vec::new();
         let mut default_branch = None;
 
@@ -501,25 +515,31 @@ impl Parser {
     // Fallback: x = 10  or  print(x)
     fn parse_expression_statement(&mut self) -> StatementNode {
         let start_span = self.peek_span();
-
         let expr = self.parse();
 
-        if let Expression::Variable {
-            name,
-            is_mutable: _,
-        } = &expr.kind
-        {
-            if self.match_token("=") {
-                let value = self.parse();
-                return StatementNode {
-                    span: start_span,
-                    kind: Statement::Assignment {
-                        name: name.clone(),
-                        value,
-                    },
-                };
+        if self.match_token("=") {
+            let value = self.parse();
+            match expr.kind {
+                Expression::Variable { name, .. } => {
+                    return StatementNode {
+                        span: start_span,
+                        kind: Statement::Assignment { name, value },
+                    };
+                }
+                Expression::Index { object, index } => {
+                    return StatementNode {
+                        span: start_span,
+                        kind: Statement::IndexAssignment {
+                            target: *object,
+                            index: *index,
+                            value,
+                        },
+                    };
+                }
+                _ => panic!("Invalid assignment target."),
             }
         }
+
         StatementNode {
             span: start_span,
             kind: Statement::Expression(expr),
@@ -717,6 +737,16 @@ impl Parser {
                         name: property,
                     },
                 };
+            } else if self.match_token("[") {
+                let index = self.parse();
+                assert!(self.match_token("]"), "Expected ']' after index expression");
+                expr = ExpressionNode {
+                    span: start_span,
+                    kind: Expression::Index {
+                        object: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                };
             } else {
                 break;
             }
@@ -768,11 +798,18 @@ impl Parser {
         }
 
         if let Ok(number) = token.parse::<f64>() {
+            let literal = if token.contains('.') {
+                LiteralValue::Float(number)
+            } else {
+                LiteralValue::Int(number as i32)
+            };
+
             return ExpressionNode {
                 span: start_span,
-                kind: Expression::Literal(LiteralValue::Number(number)),
+                kind: Expression::Literal(literal),
             };
         }
+
         // will parse strings as literals ("a", 'a')
         if (token.starts_with('"') && token.ends_with('"'))
             || (token.starts_with('\'') && token.ends_with('\''))
@@ -783,7 +820,10 @@ impl Parser {
             );
 
             // Extract the inside text by stripping out the bounding quotes
-            let inner_value = token[1..token.len() - 1].to_string();
+            let inner_value = token[1..token.len() - 1]
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\r", "\r");
 
             return ExpressionNode {
                 span: start_span,
