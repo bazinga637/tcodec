@@ -108,7 +108,7 @@ Compile Error [Line 4, Col 5]: Cannot mutably borrow 'items' because it is curre
 | `PushInt` / `PushString` | `val` | Pushes a primitive constant onto the VM stack. |
 | `GetLocal` / `SetLocal` | `slot: usize` | Reads from or writes to a local variable slot in the active `CallFrame`. |
 | `BuildArray` | `count: usize` | Pops `N` items from the stack and allocates a heap-backed `Rc<RefCell<Vec>>`. |
-| `CallFunction` | `name, arg_count` | Dispatches to either a native Rust function or pushes a new user `CallFrame`. |
+| `CallFunction` | `name, arg_count` | Dispatches to either a native Rust-written function or pushes a new user `CallFrame`. |
 | `JumpIfFalse` | `target: usize` | Pops top boolean, jumps instruction pointer (`ip`) if `false`. |
 | `LineUpdate` | `Span` | Updates the VM's active source span for runtime error reporting. |
 
