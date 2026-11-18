@@ -81,7 +81,7 @@ fn main() {
 }
 ```
 
-### Compile-Time Safety in Action
+### Compile Time Safety
 
 Attempting to mutate an array while iterating over it triggers a compile time borrow error before the VM ever starts for memory safety:
 
@@ -91,7 +91,7 @@ Compile Error [Line 4, Col 5]: Cannot mutably borrow 'items' because it is curre
 
 ---
 
-## Compiler & VM Architecture
+## Compiler & VM
 
 `tcodec` processes the source files through a 5 step pipeline:
 
