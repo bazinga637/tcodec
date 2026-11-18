@@ -24,17 +24,33 @@ use std::io::Write;
 use std::path::Path;
 
 // central error type for compiler and interpreter
-enum AppError {
+
+pub enum AppError {
     MissingFilename,
     FileNotFound(String),
     FileReadFailed(String),
     NoMainFunction,
-    RuntimeError {
+    LexicalError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    SyntaxError {
         line: usize,
         column: usize,
         message: String,
     },
     TypeError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    CompileError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    RuntimeError {
         line: usize,
         column: usize,
         message: String,
@@ -81,16 +97,16 @@ fn run_pipeline(target_filename: Option<&String>, do_bytecode: bool) -> Result<(
     let _ = log(&source_code);
 
     let lexer = Lexer::new(source_code);
-    let tokens = lexer.lex();
+    let tokens = lexer.lex()?;
     let _ = log(&tokens);
 
     let mut parser: Parser = Parser::new(tokens);
-    let ast: parser::Program = parser.parse_program();
+    let ast: parser::Program = parser.parse_program()?;
     let _ = log(&ast);
 
     TypeChecker::check(&ast)?; // Enforces type checks! Halts and bubbles out if it finds violations.
 
-    let (bytecode, user_functions) = Generator::compile(&ast);
+    let (bytecode, user_functions) = Generator::compile(&ast)?;
     let _ = log(&bytecode);
 
     if do_bytecode {
@@ -137,9 +153,46 @@ fn handle_error(err: AppError) {
             eprintln!("\x1B[1;31m[ ERR ]\x1B[0m Failed to read the file: {}", path);
         }
         AppError::NoMainFunction => {
-            print_info_after(
-                "Executing Program",
-                Some("Runtime Error: No 'main' function was found in the compiled program."),
+            eprintln!("\x1B[1;31mRuntime Error:\x1B[0m No 'main' function was found in the compiled program.");
+        }
+        AppError::LexicalError {
+            line,
+            column,
+            message,
+        } => {
+            eprintln!(
+                "\x1B[1;31mLexical Error [Line {}, Col {}]:\x1B[0m {}",
+                line, column, message
+            );
+        }
+        AppError::SyntaxError {
+            line,
+            column,
+            message,
+        } => {
+            eprintln!(
+                "\x1B[1;31mSyntax Error [Line {}, Col {}]:\x1B[0m {}",
+                line, column, message
+            );
+        }
+        AppError::TypeError {
+            line,
+            column,
+            message,
+        } => {
+            eprintln!(
+                "\x1B[1;31mType Error [Line {}, Col {}]:\x1B[0m {}",
+                line, column, message
+            );
+        }
+        AppError::CompileError {
+            line,
+            column,
+            message,
+        } => {
+            eprintln!(
+                "\x1B[1;31mCompile Error [Line {}, Col {}]:\x1B[0m {}",
+                line, column, message
             );
         }
         AppError::RuntimeError {
@@ -147,33 +200,12 @@ fn handle_error(err: AppError) {
             column,
             message,
         } => {
-            let error_msg = format!("Runtime Error [Line {}, Col {}]: {}", line, column, message);
-            print_info_after("Executing Program", Some(&error_msg));
-        }
-        AppError::TypeError {
-            line,
-            column,
-            message,
-        } => {
-            let error_msg = format!("Type Error [Line {}, Col {}]: {}", line, column, message);
-            print_info_after("Type Verification Pass", Some(&error_msg));
+            eprintln!(
+                "\x1B[1;31mRuntime Error [Line {}, Col {}]:\x1B[0m {}",
+                line, column, message
+            );
         }
     }
-}
-/*
-fn print_info_before(process: &str) {
-    println!("[     ] {process}...")
-}
-*/
-fn print_info_after(process: &str, error: Option<&str>) {
-    print!("\x1B[1A\x1B[2K"); // removes previous line so it can be rewritten
-
-    match error {
-        Some(err) => println!("\x1B[1;31m[ ERR ]\x1B[0m {process} FAILED!     \n{err}"),
-        None => println!("[ OK! ] {process} DONE!   "),
-    };
-
-    std::io::stdout().flush().unwrap(); // updates terminal to show edited lines
 }
 
 fn log<T: std::fmt::Debug>(content: &T) -> std::io::Result<()> {

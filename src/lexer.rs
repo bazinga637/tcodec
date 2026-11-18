@@ -26,6 +26,14 @@ impl Lexer {
             column: 1,
         }
     }
+
+    fn error(&self, message: &str, span: Span) -> crate::AppError {
+        crate::AppError::LexicalError {
+            line: span.line,
+            column: span.column,
+            message: message.to_string(),
+        }
+    }
     // see current token without consuming it
     fn peek(&self) -> Option<char> {
         self.chars.get(self.index).copied()
@@ -49,7 +57,7 @@ impl Lexer {
         Some(current_char)
     }
     // main lexer logic
-    pub fn lex(mut self) -> Vec<Token> {
+    pub fn lex(mut self) -> Result<Vec<Token>, crate::AppError> {
         let symbols = vec![
             '(', ')', '{', '}', '\n', '*', '+', '-', '=', '|', '&', ':', '.', ',', '[', ']',
         ];
@@ -128,6 +136,8 @@ impl Lexer {
 
                 if self.peek() == Some(quote_char) {
                     string_literal.push(self.advance().unwrap());
+                } else {
+                    return Err(self.error("Unterminated string literal.", string_start_span));
                 }
 
                 tokens.push(Token {
@@ -180,12 +190,15 @@ impl Lexer {
                     column: self.column,
                 };
 
-                let andor_operator = if self.peek() == Some(c) {
+                let andor_operator = if self.peek_next() == Some(c) {
                     self.advance();
                     self.advance();
                     format!("{}{}", c, c)
                 } else {
-                    continue;
+                    return Err(self.error(
+                        &format!("Unexpected character '{}'. Did you mean '{}{}'?", c, c, c),
+                        andor_start_span,
+                    ));
                 };
 
                 tokens.push(Token {
@@ -273,6 +286,6 @@ impl Lexer {
                 span: word_start_span,
             });
         }
-        tokens
+        Ok(tokens)
     }
 }

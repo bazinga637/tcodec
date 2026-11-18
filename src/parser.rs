@@ -174,6 +174,28 @@ impl Parser {
         Parser { tokens, index: 0 }
     }
 
+    fn error(&self, message: &str, span: Span) -> crate::AppError {
+        crate::AppError::SyntaxError {
+            line: span.line,
+            column: span.column,
+            message: message.to_string(),
+        }
+    }
+
+    fn expect_token(&mut self, expected: &str, message: &str) -> Result<Token, crate::AppError> {
+        let span = self.peek_span();
+        if self.peek() == Some(expected) {
+            Ok(self.advance().unwrap())
+        } else {
+            Err(self.error(message, span))
+        }
+    }
+
+    fn advance_or_err(&mut self, message: &str) -> Result<Token, crate::AppError> {
+        let span = self.peek_span();
+        self.advance().ok_or_else(|| self.error(message, span))
+    }
+
     // look at next token
     fn peek(&self) -> Option<&str> {
         self.tokens.get(self.index).map(|t| t.value.as_str())
@@ -214,15 +236,15 @@ impl Parser {
     }
 
     // parses statement nodes until done then returns the program AST
-    pub fn parse_program(&mut self) -> Program {
+    pub fn parse_program(&mut self) -> Result<Program, crate::AppError> {
         let mut body = Vec::new();
         while self.peek().is_some() {
-            body.push(self.parse_statement());
+            body.push(self.parse_statement()?);
         }
-        Program { body }
+        Ok(Program { body })
     }
 
-    pub fn parse_statement(&mut self) -> StatementNode {
+    pub fn parse_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         if let Some(token) = self.peek() {
             match token {
                 "let" => self.parse_var_declaration(),
@@ -236,12 +258,15 @@ impl Parser {
                 _ => self.parse_expression_statement(),
             }
         } else {
-            panic!("Unexpected end of input while looking for a statement");
+            Err(self.error(
+                "Unexpected end of input while looking for a statement",
+                self.peek_span(),
+            ))
         }
     }
 
     // parses variable declarations ( let variable = value )
-    fn parse_var_declaration(&mut self) -> StatementNode {
+    fn parse_var_declaration(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span: Span = self.peek_span(); // Grab the exact position of "let"
         self.advance(); // consume "let"
 
@@ -254,7 +279,7 @@ impl Parser {
         }
 
         // gets variable name
-        let name_token: Token = self.advance().expect("Expected variable name after 'let'");
+        let name_token: Token = self.advance_or_err("Expected variable name after 'let'")?;
         let name: String = name_token.value;
 
         // assumes variable type as 'Undeclared' unless typed after ':' ( let variable: type = value)
@@ -274,10 +299,10 @@ impl Parser {
             var_type = type_tokens.join(""); // Merges "List", "[", "int", "]" into "List[int]"
         }
 
-        assert!(self.match_token("="), "Expected '=' after variable name");
-        let initializer = self.parse();
+        self.expect_token("=", "Expected '=' after variable name")?;
+        let initializer = self.parse()?;
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span, // Assign the dynamic starting position
             kind: Statement::VarDeclaration {
                 name,
@@ -285,143 +310,140 @@ impl Parser {
                 initializer,
                 is_mutable,
             },
-        }
+        })
     }
 
     // Parses: if ( condition ) { body }
-    fn parse_if_statement(&mut self) -> StatementNode {
+    fn parse_if_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
 
         self.advance(); // consume "if"
 
-        let condition = self.parse();
+        let condition = self.parse()?;
 
-        let then_branch = Box::new(self.parse_statement());
+        let then_branch = Box::new(self.parse_statement()?);
         let mut else_branch = None;
         if self.match_token("else") {
-            else_branch = Some(Box::new(self.parse_statement()));
+            else_branch = Some(Box::new(self.parse_statement()?));
         }
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::If {
                 condition,
                 then_branch,
                 else_branch,
             },
-        }
+        })
     }
 
-    fn parse_match_statement(&mut self) -> StatementNode {
+    fn parse_match_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
         self.advance(); // consume "match"
 
-        let target = self.parse(); // Parse the evaluation expression target
+        let target = self.parse()?; // Parse the evaluation expression target
 
-        assert!(self.match_token("{"), "Expected '{{' to open match block");
+        self.expect_token("{", "Expected '{{' to open match block")?;
 
         let mut cases = Vec::new();
         let mut default_branch = None;
 
-        while self.peek() != Some("}") {
+        while let Some(tok) = self.peek() {
+            if tok == "}" {
+                break;
+            }
+
             // Check for the wildcard catch-all pattern "_"
             if self.peek() == Some("_") {
                 self.advance(); // consume "_"
-                assert!(
-                    self.match_token("=>"),
-                    "Expected '=>' thick arrow after fallback pattern '_'"
-                );
+                self.expect_token("=>", "Expected '=>' thick arrow after fallback pattern '_'")?;
 
-                default_branch = Some(Box::new(self.parse_statement()));
+                default_branch = Some(Box::new(self.parse_statement()?));
                 continue;
             }
 
             // Parse normal value patterns (e.g., "what", 5, or true)
-            let pattern = self.parse();
-            assert!(
-                self.match_token("=>"),
-                "Expected '=>' thick arrow after match pattern condition"
-            );
+            let pattern = self.parse()?;
+            self.expect_token(
+                "=>",
+                "Expected '=>' thick arrow after match pattern condition",
+            )?;
 
             let body = if self.peek() == Some("{") {
-                Box::new(self.parse_block_statement())
+                Box::new(self.parse_block_statement()?)
             } else {
-                Box::new(self.parse_statement())
+                Box::new(self.parse_statement()?)
             };
 
             cases.push(MatchCase { pattern, body });
         }
 
-        assert!(
-            self.match_token("}"),
-            "Expected '}}' to close match block execution frame"
-        );
+        self.expect_token("}", "Expected '}}' to close match block execution frame")?;
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::Match {
                 target,
                 cases,
                 default_branch,
             },
-        }
+        })
     }
 
     // Parses: while ( x ) { ... }
-    fn parse_while_loop(&mut self) -> StatementNode {
+    fn parse_while_loop(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
         self.advance(); // consume "while"
 
-        let condition = self.parse();
+        let condition = self.parse()?;
 
-        let body = Box::new(self.parse_statement());
+        let body = Box::new(self.parse_statement()?);
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::While { condition, body },
-        }
+        })
     }
 
-    fn parse_for_loop(&mut self) -> StatementNode {
+    fn parse_for_loop(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
         self.advance(); // Consume "for"
 
         // 1. Capture the iteration variable name
-        let item_token = self.advance().expect("Expected variable name after 'for'");
+        let item_token = self.advance_or_err("Expected variable name after 'for'")?;
         let item_name = item_token.value;
 
         // 2. Ensure "in" keyword is present
-        assert!(
-            self.match_token("in"),
-            "Expected 'in' keyword after variable name in for loop"
-        );
+        self.expect_token(
+            "in",
+            "Expected 'in' keyword after variable name in for loop",
+        )?;
 
         // 3. Parse the array collection/iterable expression
-        let iterable = self.parse();
+        let iterable = self.parse()?;
 
         // 4. Capture the executable body statements block
-        let body = Box::new(self.parse_statement());
+        let body = Box::new(self.parse_statement()?);
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::For {
                 item_name,
                 iterable,
                 body,
             },
-        }
+        })
     }
 
     // Parses: fn my_func ( mut a : Type , b ) { ... }
-    fn parse_function_declaration(&mut self) -> StatementNode {
+    fn parse_function_declaration(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span: Span = self.peek_span();
         self.advance(); // consume "fn"
 
         let name: String = self
-            .advance()
-            .expect("Expected function name after 'fn'")
+            .advance_or_err("Expected function name after 'fn'")?
             .value;
-        assert!(self.match_token("("), "Expected '(' after function name");
+        self.expect_token("(", "Expected '(' after function name")?;
 
         let mut params: Vec<ExpressionNode> = Vec::new();
 
@@ -433,7 +455,7 @@ impl Parser {
                     is_mutable = true;
                     self.advance();
                 }
-                let param_name: String = self.advance().expect("Expected parameter name").value;
+                let param_name: String = self.advance_or_err("Expected parameter name")?.value;
 
                 // 3. Skip type annotations if a colon ':' is present
                 if self.match_token(":") {
@@ -461,22 +483,26 @@ impl Parser {
             }
         }
 
-        assert!(self.match_token(")"), "Expected ')' after parameter list");
+        self.expect_token(")", "Expected ')' after parameter list")?;
 
-        let body_stmt = self.parse_statement();
+        if self.peek() != Some("{") {
+            return Err(self.error("Expected '{' to open function body", self.peek_span()));
+        }
+
+        let body_stmt = self.parse_statement()?;
         let body = match body_stmt.kind {
             Statement::Block(statements) => statements,
             _ => unreachable!(),
         };
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::FunctionDeclaration { name, params, body },
-        }
+        })
     }
 
     // Parses: return 5  or  return
-    fn parse_return_statement(&mut self) -> StatementNode {
+    fn parse_return_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
         self.advance(); // consume "return"
 
@@ -484,81 +510,86 @@ impl Parser {
         // Check if the next token belongs to a different statement or block closer
         if let Some(tok) = self.peek() {
             if tok != "}" && tok != "return" && tok != "let" && tok != "if" && tok != "while" {
-                value = Some(self.parse());
+                value = Some(self.parse()?);
             }
         }
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::Return(value),
-        }
+        })
     }
 
     // Parses: { stmt1 stmt2 }
-    fn parse_block_statement(&mut self) -> StatementNode {
+    fn parse_block_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
         self.advance(); // consume "{"
 
         let mut statements = Vec::new();
-        while self.peek() != Some("}") {
-            statements.push(self.parse_statement());
+        while let Some(tok) = self.peek() {
+            if tok == "}" {
+                break;
+            }
+            statements.push(self.parse_statement()?);
         }
 
-        self.advance(); // consume "}"
+        self.expect_token("}", "Expected '}' to close block")?;
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::Block(statements),
-        }
+        })
     }
 
     // Fallback: x = 10  or  print(x)
-    fn parse_expression_statement(&mut self) -> StatementNode {
+    fn parse_expression_statement(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span = self.peek_span();
-        let expr = self.parse();
+        let expr = self.parse()?;
 
         if self.match_token("=") {
-            let value = self.parse();
+            let value = self.parse()?;
             match expr.kind {
                 Expression::Variable { name, .. } => {
-                    return StatementNode {
+                    return Ok(StatementNode {
                         span: start_span,
                         kind: Statement::Assignment { name, value },
-                    };
+                    });
                 }
                 Expression::Index { object, index } => {
-                    return StatementNode {
+                    return Ok(StatementNode {
                         span: start_span,
                         kind: Statement::IndexAssignment {
                             target: *object,
                             index: *index,
                             value,
                         },
-                    };
+                    });
                 }
-                _ => panic!("Invalid assignment target."),
+                _ => {
+                    return Err(self.error("Invalid assignment target.", start_span));
+                }
             }
         }
 
-        StatementNode {
+        Ok(StatementNode {
             span: start_span,
             kind: Statement::Expression(expr),
-        }
+        })
     }
 
     // --- Expression Processing Rules ---
     // first
-    pub fn parse(&mut self) -> ExpressionNode {
+    pub fn parse(&mut self) -> Result<ExpressionNode, crate::AppError> {
         self.parse_logical_or()
     }
 
-    fn parse_logical_or(&mut self) -> ExpressionNode {
-        let mut left = self.parse_logical_and();
+    fn parse_logical_or(&mut self) -> Result<ExpressionNode, crate::AppError> {
+        let mut left = self.parse_logical_and()?;
 
         while self.peek() == Some("||") {
             let start_span = left.span;
             self.advance(); // consume "||"
-            let right = self.parse_logical_and();
+            let right = self.parse_logical_and()?;
 
             left = ExpressionNode {
                 span: start_span,
@@ -569,16 +600,16 @@ impl Parser {
                 },
             };
         }
-        left
+        Ok(left)
     }
 
-    fn parse_logical_and(&mut self) -> ExpressionNode {
-        let mut left = self.parse_comparison();
+    fn parse_logical_and(&mut self) -> Result<ExpressionNode, crate::AppError> {
+        let mut left = self.parse_comparison()?;
 
         while self.peek() == Some("&&") {
             let start_span = left.span;
             self.advance(); // consume "&&"
-            let right = self.parse_comparison();
+            let right = self.parse_comparison()?;
 
             left = ExpressionNode {
                 span: start_span,
@@ -589,11 +620,11 @@ impl Parser {
                 },
             };
         }
-        left
+        Ok(left)
     }
 
-    fn parse_comparison(&mut self) -> ExpressionNode {
-        let mut left = self.parse_additive();
+    fn parse_comparison(&mut self) -> Result<ExpressionNode, crate::AppError> {
+        let mut left = self.parse_additive()?;
 
         while let Some(token) = self.peek() {
             let operator = match token {
@@ -608,7 +639,7 @@ impl Parser {
 
             let start_span = left.span;
             self.advance(); // Consume the comparison operator token
-            let right = self.parse_additive();
+            let right = self.parse_additive()?;
 
             left = ExpressionNode {
                 span: start_span,
@@ -619,11 +650,11 @@ impl Parser {
                 },
             };
         }
-        left
+        Ok(left)
     }
 
     // Intercepts preceding '-' or '!' symbols before diving into literals
-    fn parse_unary(&mut self) -> ExpressionNode {
+    fn parse_unary(&mut self) -> Result<ExpressionNode, crate::AppError> {
         if let Some(token) = self.peek() {
             let operator = match token {
                 "-" => Some(UnaryOperator::Minus),
@@ -636,23 +667,23 @@ impl Parser {
                 self.advance(); // Consume the operator symbol token
 
                 // Recursively call parse_unary to correctly support chained elements like !!true
-                let right = self.parse_unary();
+                let right = self.parse_unary()?;
 
-                return ExpressionNode {
+                return Ok(ExpressionNode {
                     span: start_span,
                     kind: Expression::Unary {
                         operator: op,
                         right: Box::new(right),
                     },
-                };
+                });
             }
         }
         // Fallback naturally to raw numbers/variables if no prefix matches
         self.parse_primary()
     }
 
-    fn parse_additive(&mut self) -> ExpressionNode {
-        let mut left = self.parse_multiplicative();
+    fn parse_additive(&mut self) -> Result<ExpressionNode, crate::AppError> {
+        let mut left = self.parse_multiplicative()?;
         while let Some(token) = self.peek() {
             let operator = match token {
                 "+" => BinaryOperator::Add,
@@ -662,7 +693,7 @@ impl Parser {
 
             let start_span = left.span;
             self.advance();
-            let right = self.parse_multiplicative();
+            let right = self.parse_multiplicative()?;
             left = ExpressionNode {
                 span: start_span,
                 kind: Expression::Binary {
@@ -672,12 +703,12 @@ impl Parser {
                 },
             };
         }
-        left
+        Ok(left)
     }
 
-    fn parse_multiplicative(&mut self) -> ExpressionNode {
+    fn parse_multiplicative(&mut self) -> Result<ExpressionNode, crate::AppError> {
         // Route through our call & property loop interceptor
-        let mut left = self.parse_call_or_member();
+        let mut left = self.parse_call_or_member()?;
         while let Some(token) = self.peek() {
             let operator = match token {
                 "*" => BinaryOperator::Mul,
@@ -686,7 +717,7 @@ impl Parser {
             };
             let start_span = left.span;
             self.advance();
-            let right = self.parse_call_or_member();
+            let right = self.parse_call_or_member()?;
             left = ExpressionNode {
                 span: start_span,
                 kind: Expression::Binary {
@@ -696,11 +727,11 @@ impl Parser {
                 },
             };
         }
-        left
+        Ok(left)
     }
 
-    fn parse_call_or_member(&mut self) -> ExpressionNode {
-        let mut expr = self.parse_unary();
+    fn parse_call_or_member(&mut self) -> Result<ExpressionNode, crate::AppError> {
+        let mut expr = self.parse_unary()?;
 
         loop {
             let start_span = expr.span;
@@ -709,13 +740,13 @@ impl Parser {
                 let mut arguments = Vec::new();
                 if self.peek() != Some(")") {
                     loop {
-                        arguments.push(self.parse());
+                        arguments.push(self.parse()?);
                         if !self.match_token(",") {
                             break;
                         }
                     }
                 }
-                assert!(self.match_token(")"), "Expected ')' after arguments");
+                self.expect_token(")", "Expected ')' after arguments")?;
 
                 expr = ExpressionNode {
                     span: start_span,
@@ -727,8 +758,7 @@ impl Parser {
             } else if self.match_token(".") {
                 // Pure member lookup! No more string concatenation hacks.
                 let property = self
-                    .advance()
-                    .expect("Expected field or method name after '.'")
+                    .advance_or_err("Expected field or method name after '.'")?
                     .value;
                 expr = ExpressionNode {
                     span: start_span,
@@ -738,8 +768,8 @@ impl Parser {
                     },
                 };
             } else if self.match_token("[") {
-                let index = self.parse();
-                assert!(self.match_token("]"), "Expected ']' after index expression");
+                let index = self.parse()?;
+                self.expect_token("]", "Expected ']' after index expression")?;
                 expr = ExpressionNode {
                     span: start_span,
                     kind: Expression::Index {
@@ -751,11 +781,10 @@ impl Parser {
                 break;
             }
         }
-
-        expr
+        Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> ExpressionNode {
+    fn parse_primary(&mut self) -> Result<ExpressionNode, crate::AppError> {
         let start_span = self.peek_span(); // Grab the position before consuming tokens
 
         let mut is_mutable = false;
@@ -764,37 +793,38 @@ impl Parser {
             self.advance();
         }
 
-        let token_obj = self.advance().expect("Unexpected end of expression");
+        let token_obj = self.advance_or_err("Unexpected end of expression")?;
         let token = token_obj.value;
 
         if token == "(" {
             let sub_expr = self.parse();
-            assert!(self.match_token(")"), "Expected closing parenthesis ')'");
+            self.expect_token(")", "Expected closing parenthesis ')'")?;
             return sub_expr; // Keep sub-expression's internal span
         }
 
         if token == "[" {
-            assert!(
-                !is_mutable,
-                "Cannot apply 'mut' modifier to an array literal initialization"
-            );
+            if is_mutable {
+                return Err(self.error(
+                    "Cannot apply 'mut' modifier to an array literal initialization",
+                    start_span,
+                ));
+            }
+
             let mut elements = Vec::new();
             if self.peek() != Some("]") {
                 loop {
-                    elements.push(self.parse());
+                    elements.push(self.parse()?);
                     if !self.match_token(",") {
                         break;
                     }
                 }
             }
-            assert!(
-                self.match_token("]"),
-                "Expected closing bracket ']' after array elements"
-            );
-            return ExpressionNode {
+            self.expect_token("]", "Expected closing bracket ']' after array elements")?;
+
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Array(elements),
-            };
+            });
         }
 
         if let Ok(number) = token.parse::<f64>() {
@@ -804,20 +834,22 @@ impl Parser {
                 LiteralValue::Int(number as i32)
             };
 
-            return ExpressionNode {
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(literal),
-            };
+            });
         }
 
         // will parse strings as literals ("a", 'a')
         if (token.starts_with('"') && token.ends_with('"'))
             || (token.starts_with('\'') && token.ends_with('\''))
         {
-            assert!(
-                !is_mutable,
-                "Cannot apply 'mut' modifier to a string literal"
-            );
+            if is_mutable {
+                return Err(self.error(
+                    "Cannot apply 'mut' modifier to a string literal",
+                    start_span,
+                ));
+            }
 
             // Extract the inside text by stripping out the bounding quotes
             let inner_value = token[1..token.len() - 1]
@@ -825,48 +857,54 @@ impl Parser {
                 .replace("\\t", "\t")
                 .replace("\\r", "\r");
 
-            return ExpressionNode {
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(LiteralValue::String(inner_value)),
-            };
+            });
         }
 
         if token == "true" {
-            assert!(
-                !is_mutable,
-                "Cannot apply 'mut' modifier to a boolean literal"
-            );
-            return ExpressionNode {
+            if is_mutable {
+                return Err(self.error(
+                    "Cannot apply 'mut' modifier to a boolean literal",
+                    start_span,
+                ));
+            }
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(LiteralValue::Boolean(true)),
-            };
+            });
         }
 
         if token == "false" {
-            assert!(
-                !is_mutable,
-                "Cannot apply 'mut' modifier to a boolean literal"
-            );
-            return ExpressionNode {
+            if is_mutable {
+                return Err(self.error(
+                    "Cannot apply 'mut' modifier to a boolean literal",
+                    start_span,
+                ));
+            }
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(LiteralValue::Boolean(false)),
-            };
+            });
         }
 
         if token == "nil" || token == "null" {
-            assert!(!is_mutable, "Cannot apply 'mut' modifier to a nil literal");
-            return ExpressionNode {
+            if is_mutable {
+                return Err(self.error("Cannot apply 'mut' modifier to a nil literal", start_span));
+            }
+            return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(LiteralValue::Nil),
-            };
+            });
         }
 
-        ExpressionNode {
+        Ok(ExpressionNode {
             span: start_span,
             kind: Expression::Variable {
                 name: token,
                 is_mutable,
             },
-        }
+        })
     }
 }
