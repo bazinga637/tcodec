@@ -1,6 +1,6 @@
 [package]
 name = "tcodec"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["Bazinga637"]
 edition = "2021"
 description = "A custom programming language toolchain featuring implicit borrowing and explicit mutability."
