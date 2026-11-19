@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"    # Crates.io strictly requires a valid open-sour
 repository = "https://github.com/bazinga637/TCode-rust"
 readme = "README.md"
 keywords = ["compiler", "interpreter", "language", "bytecode", "vm"]
-categories = ["development-tools::compilers"]
+categories = ["compilers", "parsing"]
 
 [[bin]]
 name = "tcodec"
