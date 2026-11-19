@@ -139,6 +139,7 @@ tcodec/
 ## Roadmap
 
 * [x] Add TCode to Cargo as a crate for easier installation
+* [x] Able to pass values through break and return values from while and for loops
 * [ ] Being able to compile program into standalone binary files
 * [ ] `struct` and `enum` definitions
 * [ ] Command flags (`--bytecode`, etc.)
