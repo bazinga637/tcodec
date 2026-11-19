@@ -58,6 +58,7 @@ pub struct TypeScope {
 
 pub struct TypeChecker {
     pub scopes: Vec<TypeScope>,
+    pub loop_types: Vec<Option<Type>>,
     pub function_registry: HashMap<String, (Vec<Type>, Type)>, // Maps name -> (ParamTypes, ReturnType)
 }
 
@@ -67,6 +68,7 @@ impl TypeChecker {
             scopes: vec![TypeScope {
                 variables: HashMap::new(),
             }],
+            loop_types: Vec::new(),
             function_registry: HashMap::new(),
         };
 
@@ -262,36 +264,6 @@ impl TypeChecker {
                 }
             }
 
-            Statement::While { condition, body } => {
-                let cond_type = self.infer_expression_type(condition)?;
-                if cond_type != Type::Boolean && cond_type != Type::Undeclared {
-                    return Err(self.error(
-                        "Condition inside 'while' loop guard must evaluate to a Boolean context.",
-                        stmt.span,
-                    ));
-                }
-                self.check_statement(body)?;
-            }
-
-            Statement::For {
-                item_name,
-                iterable,
-                body,
-            } => {
-                let iter_type = self.infer_expression_type(iterable)?;
-                let element_type = match iter_type {
-                    Type::Array(inner) => *inner,
-                    Type::String => Type::String, // Iterating strings yields characters
-                    Type::Undeclared => Type::Undeclared,
-                    _ => return Err(self.error("Invalid Collection: 'for' loops can only iterate through Array or String elements.", stmt.span)),
-                };
-
-                self.push_scope();
-                self.declare_variable(item_name.clone(), element_type);
-                self.check_statement(body)?;
-                self.pop_scope();
-            }
-
             Statement::Block(statements) => {
                 self.push_scope();
                 for sub_stmt in statements {
@@ -393,11 +365,45 @@ impl TypeChecker {
                     self.infer_expression_type(expr)?;
                 }
             }
+
+            Statement::Break(maybe_expr) => {
+                let break_type = if let Some(expr) = maybe_expr {
+                    self.infer_expression_type(expr)?
+                } else {
+                    Type::Nil
+                };
+
+                if let Some(current_loop) = self.loop_types.last_mut() {
+                    match current_loop {
+                        None => *current_loop = Some(break_type),
+                        Some(expected)
+                            if *expected != Type::Undeclared
+                                && break_type != Type::Undeclared
+                                && *expected != break_type =>
+                        {
+                            let msg = format!(
+                                "Mismatched break types: expected {}, found {}",
+                                expected, break_type
+                            );
+                            return Err(self.error(&msg, stmt.span));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    return Err(self.error("Cannot use 'break' outside of a loop.", stmt.span));
+                }
+            }
+
+            Statement::Continue => {
+                if self.loop_types.is_empty() {
+                    return Err(self.error("Cannot use 'continue' outside of a loop.", stmt.span));
+                }
+            }
         }
         Ok(())
     }
 
-    pub fn infer_expression_type(&self, expr: &ExpressionNode) -> Result<Type, AppError> {
+    pub fn infer_expression_type(&mut self, expr: &ExpressionNode) -> Result<Type, AppError> {
         match &expr.kind {
             Expression::Literal(lit) => match lit {
                 LiteralValue::Int(_) => Ok(Type::Int),
@@ -578,6 +584,50 @@ impl TypeChecker {
                 } else {
                     Ok(Type::Undeclared)
                 }
+            }
+
+            Expression::While { condition, body } => {
+                let cond_type = self.infer_expression_type(condition)?;
+                if cond_type != Type::Boolean && cond_type != Type::Undeclared {
+                    return Err(self.error(
+                        "Condition inside 'while' loop guard must evaluate to a Boolean context.",
+                        expr.span,
+                    ));
+                }
+
+                self.loop_types.push(None);
+                self.check_statement(body)?;
+                let resolved_type = self.loop_types.pop().unwrap().unwrap_or(Type::Nil);
+                Ok(resolved_type)
+            }
+
+            Expression::For {
+                item_name,
+                iterable,
+                body,
+            } => {
+                let iter_type = self.infer_expression_type(iterable)?;
+                let element_type = match iter_type {
+                    Type::Array(inner) => *inner,
+                    Type::String => Type::String, // Iterating strings yields characters
+                    Type::Undeclared => Type::Undeclared,
+                    _ => {
+                        return Err(self.error(
+                            "Invalid Collection: 'for' loops can only iterate through Array or String elements.",
+                            expr.span,
+                        ))
+                    }
+                };
+
+                self.push_scope();
+                self.declare_variable(item_name.clone(), element_type);
+                self.loop_types.push(None);
+
+                self.check_statement(body)?;
+
+                let resolved_type = self.loop_types.pop().unwrap().unwrap_or(Type::Nil);
+                self.pop_scope();
+                Ok(resolved_type)
             }
 
             Expression::Index { object, index } => {

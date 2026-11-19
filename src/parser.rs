@@ -27,18 +27,6 @@ pub enum Statement {
         else_branch: Option<Box<StatementNode>>, // Optional 'else'
     },
 
-    // while cond { body }
-    While {
-        condition: ExpressionNode,
-        body: Box<StatementNode>,
-    },
-
-    For {
-        item_name: String,
-        iterable: ExpressionNode,
-        body: Box<StatementNode>,
-    },
-
     // fn name(a, b) { body }
     FunctionDeclaration {
         name: String,
@@ -46,8 +34,14 @@ pub enum Statement {
         body: Vec<StatementNode>,
     },
 
-    // return 5;
+    // return 5
     Return(Option<ExpressionNode>),
+
+    // break 5, break
+    Break(Option<ExpressionNode>),
+
+    // continue
+    Continue,
 
     // { stmt1; stmt2; }
     Block(Vec<StatementNode>),
@@ -109,6 +103,18 @@ pub enum Expression {
     Index {
         object: Box<ExpressionNode>,
         index: Box<ExpressionNode>,
+    },
+
+    // while cond { body }
+    While {
+        condition: Box<ExpressionNode>,
+        body: Box<StatementNode>,
+    },
+
+    For {
+        item_name: String,
+        iterable: Box<ExpressionNode>,
+        body: Box<StatementNode>,
     },
 }
 
@@ -250,10 +256,10 @@ impl Parser {
                 "let" => self.parse_var_declaration(),
                 "if" => self.parse_if_statement(),
                 "match" => self.parse_match_statement(),
-                "while" => self.parse_while_loop(),
-                "for" => self.parse_for_loop(),
                 "fn" => self.parse_function_declaration(),
                 "return" => self.parse_return_statement(),
+                "break" => self.parse_break_statement(),
+                "continue" => self.parse_continue_statement(),
                 "{" => self.parse_block_statement(),
                 _ => self.parse_expression_statement(),
             }
@@ -390,51 +396,6 @@ impl Parser {
         })
     }
 
-    // Parses: while ( x ) { ... }
-    fn parse_while_loop(&mut self) -> Result<StatementNode, crate::AppError> {
-        let start_span = self.peek_span();
-        self.advance(); // consume "while"
-
-        let condition = self.parse()?;
-
-        let body = Box::new(self.parse_statement()?);
-
-        Ok(StatementNode {
-            span: start_span,
-            kind: Statement::While { condition, body },
-        })
-    }
-
-    fn parse_for_loop(&mut self) -> Result<StatementNode, crate::AppError> {
-        let start_span = self.peek_span();
-        self.advance(); // Consume "for"
-
-        // 1. Capture the iteration variable name
-        let item_token = self.advance_or_err("Expected variable name after 'for'")?;
-        let item_name = item_token.value;
-
-        // 2. Ensure "in" keyword is present
-        self.expect_token(
-            "in",
-            "Expected 'in' keyword after variable name in for loop",
-        )?;
-
-        // 3. Parse the array collection/iterable expression
-        let iterable = self.parse()?;
-
-        // 4. Capture the executable body statements block
-        let body = Box::new(self.parse_statement()?);
-
-        Ok(StatementNode {
-            span: start_span,
-            kind: Statement::For {
-                item_name,
-                iterable,
-                body,
-            },
-        })
-    }
-
     // Parses: fn my_func ( mut a : Type , b ) { ... }
     fn parse_function_declaration(&mut self) -> Result<StatementNode, crate::AppError> {
         let start_span: Span = self.peek_span();
@@ -509,7 +470,19 @@ impl Parser {
         let mut value = None;
         // Check if the next token belongs to a different statement or block closer
         if let Some(tok) = self.peek() {
-            if tok != "}" && tok != "return" && tok != "let" && tok != "if" && tok != "while" {
+            let is_boundary = matches!(
+                tok,
+                "}" | "return"
+                    | "break"
+                    | "continue"
+                    | "let"
+                    | "if"
+                    | "while"
+                    | "for"
+                    | "match"
+                    | "fn"
+            );
+            if !is_boundary {
                 value = Some(self.parse()?);
             }
         }
@@ -517,6 +490,46 @@ impl Parser {
         Ok(StatementNode {
             span: start_span,
             kind: Statement::Return(value),
+        })
+    }
+
+    fn parse_break_statement(&mut self) -> Result<StatementNode, crate::AppError> {
+        let start_span = self.peek_span();
+        self.advance(); // consume "break"
+
+        let mut value = None;
+        // Check if the next token belongs to a different statement or block closer
+        if let Some(tok) = self.peek() {
+            let is_boundary = matches!(
+                tok,
+                "}" | "return"
+                    | "break"
+                    | "continue"
+                    | "let"
+                    | "if"
+                    | "while"
+                    | "for"
+                    | "match"
+                    | "fn"
+            );
+            if !is_boundary {
+                value = Some(self.parse()?);
+            }
+        }
+
+        Ok(StatementNode {
+            span: start_span,
+            kind: Statement::Break(value),
+        })
+    }
+
+    fn parse_continue_statement(&mut self) -> Result<StatementNode, crate::AppError> {
+        let start_span = self.peek_span();
+        self.advance(); // consume "continue"
+
+        Ok(StatementNode {
+            span: start_span,
+            kind: Statement::Continue,
         })
     }
 
@@ -860,6 +873,41 @@ impl Parser {
             return Ok(ExpressionNode {
                 span: start_span,
                 kind: Expression::Literal(LiteralValue::String(inner_value)),
+            });
+        }
+
+        if token == "while" {
+            if is_mutable {
+                return Err(self.error("Cannot apply 'mut' modifier to a while loop", start_span));
+            }
+            let condition = Box::new(self.parse()?);
+            let body = Box::new(self.parse_statement()?);
+            return Ok(ExpressionNode {
+                span: start_span,
+                kind: Expression::While { condition, body },
+            });
+        }
+
+        if token == "for" {
+            if is_mutable {
+                return Err(self.error("Cannot apply 'mut' modifier to a for loop", start_span));
+            }
+            let item_name = self
+                .advance_or_err("Expected variable name after 'for'")?
+                .value;
+            self.expect_token(
+                "in",
+                "Expected 'in' keyword after variable name in for loop",
+            )?;
+            let iterable = Box::new(self.parse()?);
+            let body = Box::new(self.parse_statement()?);
+            return Ok(ExpressionNode {
+                span: start_span,
+                kind: Expression::For {
+                    item_name,
+                    iterable,
+                    body,
+                },
             });
         }
 

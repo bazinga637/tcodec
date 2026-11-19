@@ -86,12 +86,20 @@ pub struct Scope {
     pub depth_start_index: usize,
 }
 
+pub struct LoopContext {
+    pub continue_jumps: Vec<usize>,
+    pub continue_target: Option<usize>,
+    pub break_jumps: Vec<usize>,
+    pub base_locals_count: usize,
+}
+
 pub struct Generator {
     pub bytecode: Vec<OpCode>,
     pub scopes: Vec<Scope>, // A stack of lexical blocks
 
     pub function_registry: HashMap<String, usize>,
     pub locals_count: usize,
+    pub loop_stack: Vec<LoopContext>,
 }
 
 impl Generator {
@@ -106,6 +114,7 @@ impl Generator {
 
             function_registry: HashMap::new(),
             locals_count: 0,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -422,6 +431,13 @@ impl Generator {
                         *target = fallthrough_address;
                     }
                 }
+                // Compile the default branch down below the escape terminal vector bounds
+                if let Some(default_stmt) = default_branch {
+                    self.compile_statement(default_stmt)?;
+                } else {
+                    self.emit(OpCode::PushNil);
+                    self.emit(OpCode::Pop);
+                }
 
                 // Calculate the match end right here, BEFORE the default branch compiles
                 // to ensure all successful pattern arms leap completely past the default block
@@ -432,14 +448,6 @@ impl Generator {
                     if let Some(OpCode::Jump(target)) = self.bytecode.get_mut(exit_jump) {
                         *target = match_end_address;
                     }
-                }
-
-                // Compile the default branch down below the escape terminal vector bounds
-                if let Some(default_stmt) = default_branch {
-                    self.compile_statement(default_stmt)?;
-                } else {
-                    self.emit(OpCode::PushNil);
-                    self.emit(OpCode::Pop);
                 }
 
                 // Pop the match block scope context safely using the parameterless helper
@@ -566,104 +574,6 @@ impl Generator {
                 }
             }
 
-            Statement::While { condition, body } => {
-                let loop_start_ip = self.bytecode.len();
-                self.compile_expression(condition)?;
-                self.clear_temporary_statement_loans();
-
-                let jump_false_ip = self.emit(OpCode::JumpIfFalse(0));
-                self.compile_statement(body)?;
-
-                self.emit(OpCode::Jump(loop_start_ip));
-
-                let loop_end_ip = self.bytecode.len();
-                if let Some(OpCode::JumpIfFalse(target)) = self.bytecode.get_mut(jump_false_ip) {
-                    *target = loop_end_ip;
-                }
-            }
-
-            Statement::For {
-                item_name,
-                iterable,
-                body,
-            } => {
-                let hidden_idx_name = format!("$idx_{}", self.bytecode.len());
-                let hidden_list_name = format!("$list_{}", self.bytecode.len());
-
-                // If the container is a variable, register a shared lease
-                let mut source_iterable_var = None;
-                if let Expression::Variable { name: var_name, .. } = &iterable.kind {
-                    source_iterable_var = Some(var_name.clone());
-                    self.borrow_variable(var_name, BorrowKind::Shared, stmt.span)?;
-                }
-
-                self.push_scope();
-
-                // --- Initializers ---
-                self.compile_expression(iterable)?;
-                self.clear_temporary_statement_loans();
-                let list_slot = self.locals_count;
-                self.locals_count += 1;
-                self.insert_variable_metadata(hidden_list_name.clone(), list_slot, false);
-                self.emit(OpCode::SetLocal(list_slot));
-
-                self.emit(OpCode::PushInt(0));
-                let idx_slot = self.locals_count;
-                self.locals_count += 1;
-                self.insert_variable_metadata(hidden_idx_name.clone(), idx_slot, true);
-                self.emit(OpCode::SetLocal(idx_slot));
-
-                // --- Loop Condition Guard ---
-                let loop_start_ip = self.bytecode.len();
-                self.emit(OpCode::GetLocal(idx_slot));
-
-                self.emit(OpCode::GetLocal(list_slot));
-                self.emit(OpCode::CallFunction {
-                    name: "len".to_string(),
-                    arg_count: 1,
-                });
-                self.emit(OpCode::LessThan);
-
-                let jump_false_ip = self.emit(OpCode::JumpIfFalse(0));
-
-                // --- Inner Loop Workspace ---
-                let item_slot = self.locals_count;
-                self.locals_count += 1;
-                self.insert_variable_metadata(item_name.clone(), item_slot, false);
-
-                self.emit(OpCode::GetLocal(list_slot));
-                self.emit(OpCode::GetLocal(idx_slot));
-                self.emit(OpCode::CallMethod {
-                    name: "get".to_string(),
-                    arg_count: 1,
-                });
-                self.emit(OpCode::SetLocal(item_slot));
-
-                self.compile_statement(body)?;
-
-                // --- Loop Counter Increment ---
-                self.emit(OpCode::GetLocal(idx_slot));
-                self.emit(OpCode::PushInt(1));
-                self.emit(OpCode::Add);
-                self.emit(OpCode::SetLocal(idx_slot));
-
-                self.emit(OpCode::Jump(loop_start_ip));
-
-                let loop_end_ip = self.bytecode.len();
-                if let Some(OpCode::JumpIfFalse(target)) = self.bytecode.get_mut(jump_false_ip) {
-                    *target = loop_end_ip;
-                }
-
-                self.pop_scope();
-
-                // Release container lock when loop concludes
-                if let Some(var_name) = source_iterable_var {
-                    if let Some(meta) = self.resolve_variable_metadata_mut(&var_name) {
-                        meta.active_loans.retain(|l| l.provider_name != var_name);
-                    }
-                }
-            }
-
             Statement::IndexAssignment {
                 target,
                 index,
@@ -704,6 +614,42 @@ impl Generator {
                 }
 
                 self.emit(OpCode::Return);
+            }
+            Statement::Break(maybe_expr) => {
+                if self.loop_stack.is_empty() {
+                    return Err(self.error("Cannot 'break' outside of a loop.", stmt.span));
+                }
+                if let Some(expr) = maybe_expr {
+                    self.compile_expression(expr)?;
+                } else {
+                    self.emit(OpCode::PushNil);
+                }
+                let jump_ip = self.emit(OpCode::Jump(0));
+                self.loop_stack
+                    .last_mut()
+                    .unwrap()
+                    .break_jumps
+                    .push(jump_ip);
+            }
+
+            Statement::Continue => {
+                let continue_target = match self.loop_stack.last() {
+                    Some(ctx) => ctx.continue_target,
+                    None => {
+                        return Err(self.error("Cannot 'continue' outside of a loop.", stmt.span));
+                    }
+                };
+
+                if let Some(target) = continue_target {
+                    self.emit(OpCode::Jump(target));
+                } else {
+                    let jump_ip = self.emit(OpCode::Jump(0));
+                    self.loop_stack
+                        .last_mut()
+                        .unwrap()
+                        .continue_jumps
+                        .push(jump_ip);
+                }
             }
 
             _ => todo!("Got statement that is yet to be implemented."),
@@ -894,6 +840,148 @@ impl Generator {
                         "Dynamic/Anonymous function calls are not supported yet.",
                         expr.span,
                     ));
+                }
+            }
+
+            Expression::While { condition, body } => {
+                let loop_start_ip = self.bytecode.len();
+
+                self.loop_stack.push(LoopContext {
+                    continue_jumps: Vec::new(),
+                    continue_target: Some(loop_start_ip),
+                    break_jumps: Vec::new(),
+                    base_locals_count: self.locals_count,
+                });
+
+                self.compile_expression(condition)?;
+                self.clear_temporary_statement_loans();
+
+                let jump_false_ip = self.emit(OpCode::JumpIfFalse(0));
+                self.compile_statement(body)?;
+                self.emit(OpCode::Jump(loop_start_ip));
+
+                // Natural loop exit: condition became false
+                let natural_end_ip = self.bytecode.len();
+                if let Some(OpCode::JumpIfFalse(target)) = self.bytecode.get_mut(jump_false_ip) {
+                    *target = natural_end_ip;
+                }
+                self.emit(OpCode::PushNil);
+
+                // Break exit: value is already on the stack, skip PushNil
+                let after_loop_ip = self.bytecode.len();
+                let loop_ctx = self.loop_stack.pop().unwrap();
+                self.locals_count = loop_ctx.base_locals_count;
+
+                for break_ip in loop_ctx.break_jumps {
+                    if let Some(OpCode::Jump(target)) = self.bytecode.get_mut(break_ip) {
+                        *target = after_loop_ip;
+                    }
+                }
+            }
+
+            Expression::For {
+                item_name,
+                iterable,
+                body,
+            } => {
+                let hidden_idx_name = format!("$idx_{}", self.bytecode.len());
+                let hidden_list_name = format!("$list_{}", self.bytecode.len());
+
+                let mut source_iterable_var = None;
+                if let Expression::Variable { name: var_name, .. } = &iterable.kind {
+                    source_iterable_var = Some(var_name.clone());
+                    self.borrow_variable(var_name, BorrowKind::Shared, expr.span)?;
+                }
+
+                self.push_scope();
+
+                // Initializers
+                self.compile_expression(iterable)?;
+                self.clear_temporary_statement_loans();
+                let list_slot = self.locals_count;
+                self.locals_count += 1;
+                self.insert_variable_metadata(hidden_list_name, list_slot, false);
+                self.emit(OpCode::SetLocal(list_slot));
+
+                self.emit(OpCode::PushInt(0));
+                let idx_slot = self.locals_count;
+                self.locals_count += 1;
+                self.insert_variable_metadata(hidden_idx_name, idx_slot, true);
+                self.emit(OpCode::SetLocal(idx_slot));
+
+                // Loop Condition Guard
+                let loop_start_ip = self.bytecode.len();
+                self.emit(OpCode::GetLocal(idx_slot));
+                self.emit(OpCode::GetLocal(list_slot));
+                self.emit(OpCode::CallFunction {
+                    name: "len".to_string(),
+                    arg_count: 1,
+                });
+                self.emit(OpCode::LessThan);
+
+                let jump_false_ip = self.emit(OpCode::JumpIfFalse(0));
+
+                // Inner Loop Workspace
+                let item_slot = self.locals_count;
+                self.locals_count += 1;
+                self.insert_variable_metadata(item_name.clone(), item_slot, false);
+
+                self.emit(OpCode::GetLocal(list_slot));
+                self.emit(OpCode::GetLocal(idx_slot));
+                self.emit(OpCode::CallMethod {
+                    name: "get".to_string(),
+                    arg_count: 1,
+                });
+                self.emit(OpCode::SetLocal(item_slot));
+
+                self.loop_stack.push(LoopContext {
+                    continue_jumps: Vec::new(),
+                    continue_target: None, // Backpatched right before idx + 1
+                    break_jumps: Vec::new(),
+                    base_locals_count: self.locals_count,
+                });
+
+                self.compile_statement(body)?;
+
+                // Backpatch `continue` jumps to land right here before incrementing idx
+                let increment_ip = self.bytecode.len();
+                let loop_ctx = self.loop_stack.pop().unwrap();
+                self.locals_count = loop_ctx.base_locals_count;
+
+                for cont_ip in loop_ctx.continue_jumps {
+                    if let Some(OpCode::Jump(target)) = self.bytecode.get_mut(cont_ip) {
+                        *target = increment_ip;
+                    }
+                }
+
+                // Loop Counter Increment
+                self.emit(OpCode::GetLocal(idx_slot));
+                self.emit(OpCode::PushInt(1));
+                self.emit(OpCode::Add);
+                self.emit(OpCode::SetLocal(idx_slot));
+                self.emit(OpCode::Jump(loop_start_ip));
+
+                // Natural loop exit
+                let natural_end_ip = self.bytecode.len();
+                if let Some(OpCode::JumpIfFalse(target)) = self.bytecode.get_mut(jump_false_ip) {
+                    *target = natural_end_ip;
+                }
+                self.emit(OpCode::PushNil);
+
+                // Break exit
+                let after_loop_ip = self.bytecode.len();
+                for break_ip in loop_ctx.break_jumps {
+                    if let Some(OpCode::Jump(target)) = self.bytecode.get_mut(break_ip) {
+                        *target = after_loop_ip;
+                    }
+                }
+
+                self.pop_scope();
+
+                if let Some(var_name) = source_iterable_var {
+                    if let Some(meta) = self.resolve_variable_metadata_mut(&var_name) {
+                        meta.active_loans.retain(|l| l.provider_name != var_name);
+                    }
                 }
             }
 
