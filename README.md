@@ -26,6 +26,10 @@ I built this language mostly for fun as a grade 11 student, but also because Rus
 Install directly via Cargo:
 
 ```bash
+cargo install tcodec
+```
+or
+```bash
 cargo install --git https://github.com/bazinga637/tcodec
 ```
 
