@@ -26,6 +26,10 @@ I built this language mostly for fun as a grade 11 student, but also because Rus
 Install directly via Cargo:
 
 ```bash
+cargo install tcodec
+```
+or
+```bash
 cargo install --git https://github.com/bazinga637/tcodec
 ```
 
@@ -134,8 +138,8 @@ tcodec/
 
 ## Roadmap
 
+* [x] Add TCode to Cargo as a crate for easier installation
 * [ ] Being able to compile program into standalone binary files
-* [ ] Add TCode to Cargo as a crate for easier installation
 * [ ] `struct` and `enum` definitions
 * [ ] Command flags (`--bytecode`, etc.)
 
