@@ -134,8 +134,8 @@ tcodec/
 
 ## Roadmap
 
+* [x] Add TCode to Cargo as a crate for easier installation
 * [ ] Being able to compile program into standalone binary files
-* [ ] Add TCode to Cargo as a crate for easier installation
 * [ ] `struct` and `enum` definitions
 * [ ] Command flags (`--bytecode`, etc.)
 
