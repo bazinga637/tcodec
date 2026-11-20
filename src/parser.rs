@@ -20,6 +20,19 @@ pub enum Statement {
         value: ExpressionNode,
     },
 
+    CompoundAssignment {
+        name: String,
+        operator: CompoundOperator,
+        value: ExpressionNode,
+    },
+
+    CompoundIndexAssignment {
+        target: ExpressionNode,
+        index: ExpressionNode,
+        operator: CompoundOperator,
+        value: ExpressionNode,
+    },
+
     // if cond { then } else { else }
     If {
         condition: ExpressionNode,
@@ -132,7 +145,8 @@ pub enum BinaryOperator {
     Add,
     Sub,
     Mul,
-    Div, // Math
+    Div,
+    Mod, // Math
     Equal,
     NotEqual,
     LessThan,
@@ -147,6 +161,15 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Minus, // Negation: -x
     Not,   // Logical NOT: !x
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CompoundOperator {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +607,53 @@ impl Parser {
             }
         }
 
+        let compound_op = if self.match_token("+=") {
+            Some(CompoundOperator::Add)
+        } else if self.match_token("-=") {
+            Some(CompoundOperator::Sub)
+        } else if self.match_token("*=") {
+            Some(CompoundOperator::Mul)
+        } else if self.match_token("/=") {
+            Some(CompoundOperator::Div)
+        } else if self.match_token("%=") {
+            Some(CompoundOperator::Mod)
+        } else {
+            None
+        };
+
+        if let Some(operator) = compound_op {
+            let value = self.parse()?;
+            match expr.kind {
+                Expression::Variable { name, .. } => {
+                    return Ok(StatementNode {
+                        span: start_span,
+                        kind: Statement::CompoundAssignment {
+                            name,
+                            operator,
+                            value,
+                        },
+                    });
+                }
+                Expression::Index { object, index } => {
+                    return Ok(StatementNode {
+                        span: start_span,
+                        kind: Statement::CompoundIndexAssignment {
+                            target: *object,
+                            index: *index,
+                            operator,
+                            value,
+                        },
+                    });
+                }
+                _ => {
+                    return Err(self.error(
+                        "Compound assignment is only supported on variables and array indices.",
+                        start_span,
+                    ));
+                }
+            }
+        }
+
         Ok(StatementNode {
             span: start_span,
             kind: Statement::Expression(expr),
@@ -726,6 +796,7 @@ impl Parser {
             let operator = match token {
                 "*" => BinaryOperator::Mul,
                 "/" => BinaryOperator::Div,
+                "%" => BinaryOperator::Mod,
                 _ => break,
             };
             let start_span = left.span;
@@ -868,7 +939,10 @@ impl Parser {
             let inner_value = token[1..token.len() - 1]
                 .replace("\\n", "\n")
                 .replace("\\t", "\t")
-                .replace("\\r", "\r");
+                .replace("\\r", "\r")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .replace("\\\\", "\\");
 
             return Ok(ExpressionNode {
                 span: start_span,

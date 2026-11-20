@@ -112,6 +112,18 @@ impl TypeChecker {
             .insert("chr".to_string(), (vec![Type::Int], Type::String));
         self.function_registry
             .insert("ord".to_string(), (vec![Type::String], Type::Int));
+        self.function_registry
+            .insert("int".to_string(), (vec![], Type::Int));
+        self.function_registry
+            .insert("float".to_string(), (vec![], Type::Float));
+        self.function_registry
+            .insert("string".to_string(), (vec![], Type::String));
+        self.function_registry.insert(
+            "randint".to_string(),
+            (vec![Type::Int, Type::Int], Type::Int),
+        );
+        self.function_registry
+            .insert("randflt".to_string(), (vec![], Type::Float));
     }
 
     fn error(&self, message: &str, span: crate::lexer::Span) -> AppError {
@@ -243,6 +255,92 @@ impl TypeChecker {
                         ),
                         stmt.span,
                     ));
+                }
+            }
+
+            Statement::CompoundAssignment {
+                name,
+                operator,
+                value,
+            } => {
+                let expected_type = match self.resolve_variable_type(name) {
+                    Some(t) => t,
+                    None => {
+                        return Err(self.error(
+                            &format!("Variable '{}' assigned before declaration.", name),
+                            stmt.span,
+                        ))
+                    }
+                };
+
+                let rhs_type = self.infer_expression_type(value)?;
+
+                match operator {
+                    crate::parser::CompoundOperator::Add if expected_type == Type::String => {
+                        if rhs_type != Type::String && rhs_type != Type::Undeclared {
+                            return Err(self.error(
+                                &format!(
+                                    "Cannot concatenate {} to <string> variable '{}'.",
+                                    rhs_type, name
+                                ),
+                                stmt.span,
+                            ));
+                        }
+                    }
+                    _ => {
+                        let is_lhs_num =
+                            matches!(expected_type, Type::Int | Type::Float | Type::Undeclared);
+                        let is_rhs_num =
+                            matches!(rhs_type, Type::Int | Type::Float | Type::Undeclared);
+                        if !is_lhs_num || !is_rhs_num {
+                            return Err(self.error(
+                                "Compound math assignment requires numeric operands.",
+                                stmt.span,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            Statement::CompoundIndexAssignment {
+                target,
+                index,
+                operator: _,
+                value,
+            } => {
+                let target_type = self.infer_expression_type(target)?;
+                let index_type = self.infer_expression_type(index)?;
+                let value_type = self.infer_expression_type(value)?;
+
+                if index_type != Type::Int && index_type != Type::Undeclared {
+                    return Err(self.error(
+                        &format!("Array index must be of type <int>, found {}.", index_type),
+                        index.span,
+                    ));
+                }
+
+                match target_type {
+                    Type::Array(inner) => {
+                        if *inner != Type::Undeclared
+                            && value_type != Type::Undeclared
+                            && *inner != value_type
+                        {
+                            return Err(self.error(
+                                &format!(
+                                    "Cannot apply compound assignment of type {} to array of type <array[{}]>.",
+                                    value_type, inner
+                                ),
+                                stmt.span,
+                            ));
+                        }
+                    }
+                    Type::Undeclared => {}
+                    _ => {
+                        return Err(self.error(
+                            &format!("Cannot index-assign into non-array type {}.", target_type),
+                            target.span,
+                        ));
+                    }
                 }
             }
 
@@ -456,7 +554,10 @@ impl TypeChecker {
                         }
                     }
 
-                    BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div => {
+                    BinaryOperator::Sub
+                    | BinaryOperator::Mul
+                    | BinaryOperator::Div
+                    | BinaryOperator::Mod => {
                         let is_left_numeric =
                             matches!(left_type, Type::Int | Type::Float | Type::Undeclared);
                         let is_right_numeric =

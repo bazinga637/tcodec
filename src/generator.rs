@@ -2,8 +2,10 @@ use crate::parser::{
     BinaryOperator, Expression, ExpressionNode, LiteralValue, Program, Statement, StatementNode,
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::lexer::Span;
+use crate::parser::CompoundOperator;
 /*
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Ownership {
@@ -16,7 +18,7 @@ pub enum Ownership {
 pub enum OpCode {
     PushInt(i32),
     PushFloat(f64),
-    PushString(String),
+    PushString(Rc<String>),
     PushBoolean(bool),
     PushNil,
 
@@ -27,11 +29,18 @@ pub enum OpCode {
     GetIndex,
     SetIndex,
 
+    GetLocalIndex(usize),
+    SetLocalIndex(usize),
+    CompoundAssignLocalIndex(usize, CompoundOperator),
+
     // Evaluation Commands
     Add,
     Sub,
     Mul,
     Div,
+    Mod,
+    CompoundAssignLocal(usize, CompoundOperator),
+    CompoundAssignIndex(CompoundOperator),
     Equal,
     NotEqual,
     LessThan,
@@ -46,8 +55,8 @@ pub enum OpCode {
 
     // Structures
     BuildArray(usize), // Pop N items to construct an array literal
-    CallMethod { name: String, arg_count: usize },
-    CallFunction { name: String, arg_count: usize },
+    CallMethod { name: Rc<String>, arg_count: usize },
+    CallFunction { name: Rc<String>, arg_count: usize },
     // Jumps (The usize is the instruction pointer index to jump to)
     Jump(usize),
     JumpIfFalse(usize),
@@ -100,6 +109,7 @@ pub struct Generator {
     pub function_registry: HashMap<String, usize>,
     pub locals_count: usize,
     pub loop_stack: Vec<LoopContext>,
+    pub last_emitted_line: usize,
 }
 
 impl Generator {
@@ -115,6 +125,7 @@ impl Generator {
             function_registry: HashMap::new(),
             locals_count: 0,
             loop_stack: Vec::new(),
+            last_emitted_line: 0,
         }
     }
 
@@ -123,6 +134,14 @@ impl Generator {
             line: span.line,
             column: span.column,
             message: message.to_string(),
+        }
+    }
+
+    fn root_variable_name(expr: &ExpressionNode) -> Option<&str> {
+        match &expr.kind {
+            Expression::Variable { name, .. } => Some(name.as_str()),
+            Expression::Index { object, .. } => Self::root_variable_name(object),
+            _ => None,
         }
     }
 
@@ -296,7 +315,10 @@ impl Generator {
     }
 
     pub fn compile_statement(&mut self, stmt: &StatementNode) -> Result<(), crate::AppError> {
-        self.emit(OpCode::LineUpdate(stmt.span));
+        if stmt.span.line != self.last_emitted_line {
+            self.last_emitted_line = stmt.span.line;
+            self.emit(OpCode::LineUpdate(stmt.span));
+        }
 
         #[allow(unreachable_patterns)]
         match &stmt.kind {
@@ -335,6 +357,104 @@ impl Generator {
                 let slot = self.resolve_local(name).unwrap();
                 self.emit(OpCode::SetLocal(slot));
                 self.clear_temporary_statement_loans();
+            }
+
+            Statement::CompoundAssignment {
+                name,
+                operator,
+                value,
+            } => {
+                if let Some(metadata) = self.resolve_variable_metadata(name) {
+                    if !metadata.is_mutable {
+                        return Err(self.error(
+                &format!("Cannot assign to variable '{}' because it was not explicitly declared as mutable with 'mut'.", name),
+                stmt.span,
+            ));
+                    }
+                    if !metadata.active_loans.is_empty() {
+                        return Err(self.error(
+                &format!("Cannot mutate variable '{}' because it is currently implicitly borrowed elsewhere.", name),
+                stmt.span,
+            ));
+                    }
+                } else {
+                    return Err(self.error(
+                        &format!("Variable '{}' assigned before declaration.", name),
+                        stmt.span,
+                    ));
+                }
+
+                self.compile_expression(value)?;
+                let slot = self.resolve_local(name).unwrap();
+                self.emit(OpCode::CompoundAssignLocal(slot, *operator));
+                self.clear_temporary_statement_loans();
+            }
+
+            Statement::IndexAssignment {
+                target,
+                index,
+                value,
+            } => {
+                if let Expression::Variable { name: obj_name, .. } = &target.kind {
+                    let slot = self.resolve_local(obj_name).ok_or_else(|| {
+                        self.error(
+                            &format!("Variable '{}' used before declaration.", obj_name),
+                            stmt.span,
+                        )
+                    })?;
+                    self.compile_expression(index)?;
+                    self.compile_expression(value)?;
+                    self.clear_temporary_statement_loans();
+                    self.borrow_variable(obj_name, BorrowKind::Mut, stmt.span)?;
+                    self.emit(OpCode::SetLocalIndex(slot));
+                    self.clear_temporary_statement_loans();
+                } else {
+                    self.compile_expression(target)?;
+                    self.compile_expression(index)?;
+                    self.compile_expression(value)?;
+                    self.clear_temporary_statement_loans();
+
+                    if let Some(root_name) = Self::root_variable_name(target) {
+                        self.borrow_variable(root_name, BorrowKind::Mut, stmt.span)?;
+                    }
+
+                    self.emit(OpCode::SetIndex);
+                    self.clear_temporary_statement_loans();
+                }
+            }
+
+            Statement::CompoundIndexAssignment {
+                target,
+                index,
+                value,
+                operator,
+            } => {
+                if let Expression::Variable { name: obj_name, .. } = &target.kind {
+                    let slot = self.resolve_local(obj_name).ok_or_else(|| {
+                        self.error(
+                            &format!("Variable '{}' used before declaration.", obj_name),
+                            stmt.span,
+                        )
+                    })?;
+                    self.compile_expression(index)?;
+                    self.compile_expression(value)?;
+                    self.clear_temporary_statement_loans();
+                    self.borrow_variable(obj_name, BorrowKind::Mut, stmt.span)?;
+                    self.emit(OpCode::CompoundAssignLocalIndex(slot, *operator));
+                    self.clear_temporary_statement_loans();
+                } else {
+                    self.compile_expression(target)?;
+                    self.compile_expression(index)?;
+                    self.compile_expression(value)?;
+                    self.clear_temporary_statement_loans();
+
+                    if let Some(root_name) = Self::root_variable_name(target) {
+                        self.borrow_variable(root_name, BorrowKind::Mut, stmt.span)?;
+                    }
+
+                    self.emit(OpCode::CompoundAssignIndex(*operator));
+                    self.clear_temporary_statement_loans();
+                }
             }
 
             Statement::Expression(expr) => {
@@ -507,6 +627,7 @@ impl Generator {
 
                 // Setup a clean local variable scope space for this function
                 self.push_scope();
+                self.last_emitted_line = 0;
 
                 // Map parameters directly to slots 0, 1, 2 sequentially
                 for (i, param) in params.iter().enumerate() {
@@ -574,36 +695,6 @@ impl Generator {
                 }
             }
 
-            Statement::IndexAssignment {
-                target,
-                index,
-                value,
-            } => {
-                if let Expression::Variable { name: obj_name, .. } = &target.kind {
-                    if let Some(slot) = self.resolve_local(obj_name) {
-                        self.emit(OpCode::GetLocal(slot));
-                    } else {
-                        return Err(self.error(
-                            &format!("Variable '{}' used before declaration.", obj_name),
-                            stmt.span,
-                        ));
-                    }
-                } else {
-                    self.compile_expression(target)?;
-                }
-
-                self.compile_expression(index)?;
-                self.compile_expression(value)?;
-                self.clear_temporary_statement_loans();
-
-                if let Expression::Variable { name: obj_name, .. } = &target.kind {
-                    self.borrow_variable(obj_name, BorrowKind::Mut, stmt.span)?;
-                }
-
-                self.emit(OpCode::SetIndex);
-                self.clear_temporary_statement_loans();
-            }
-
             Statement::Return(maybe_expr) => {
                 if let Some(expr) = maybe_expr {
                     // If an expression exists compile it onto the evaluation stack
@@ -668,7 +759,7 @@ impl Generator {
                     self.emit(OpCode::PushFloat(*n));
                 }
                 LiteralValue::String(s) => {
-                    self.emit(OpCode::PushString(s.clone()));
+                    self.emit(OpCode::PushString(Rc::new(s.to_string())));
                 }
                 LiteralValue::Boolean(b) => {
                     self.emit(OpCode::PushBoolean(*b));
@@ -730,6 +821,9 @@ impl Generator {
                     }
                     BinaryOperator::Div => {
                         self.emit(OpCode::Div);
+                    }
+                    BinaryOperator::Mod => {
+                        self.emit(OpCode::Mod);
                     }
                     BinaryOperator::Equal => {
                         self.emit(OpCode::Equal);
@@ -816,7 +910,7 @@ impl Generator {
                     }
 
                     self.emit(OpCode::CallMethod {
-                        name: name.clone(),
+                        name: Rc::new(name.clone()),
                         arg_count: arguments.len(),
                     });
 
@@ -832,7 +926,7 @@ impl Generator {
                     }
 
                     self.emit(OpCode::CallFunction {
-                        name: name.clone(),
+                        name: Rc::new(name.clone()),
                         arg_count: arguments.len(),
                     });
                 } else {
@@ -914,7 +1008,7 @@ impl Generator {
                 self.emit(OpCode::GetLocal(idx_slot));
                 self.emit(OpCode::GetLocal(list_slot));
                 self.emit(OpCode::CallFunction {
-                    name: "len".to_string(),
+                    name: Rc::new("len".to_string()),
                     arg_count: 1,
                 });
                 self.emit(OpCode::LessThan);
@@ -928,10 +1022,7 @@ impl Generator {
 
                 self.emit(OpCode::GetLocal(list_slot));
                 self.emit(OpCode::GetLocal(idx_slot));
-                self.emit(OpCode::CallMethod {
-                    name: "get".to_string(),
-                    arg_count: 1,
-                });
+                self.emit(OpCode::GetIndex);
                 self.emit(OpCode::SetLocal(item_slot));
 
                 self.loop_stack.push(LoopContext {
@@ -986,6 +1077,14 @@ impl Generator {
             }
 
             Expression::Index { object, index } => {
+                if let Expression::Variable { name, .. } = &object.kind {
+                    self.borrow_variable(name, BorrowKind::Shared, object.span)?;
+                    if let Some(slot) = self.resolve_local(name) {
+                        self.compile_expression(index)?;
+                        self.emit(OpCode::GetLocalIndex(slot));
+                        return Ok(());
+                    }
+                }
                 self.compile_expression(object)?;
                 self.compile_expression(index)?;
                 self.emit(OpCode::GetIndex);

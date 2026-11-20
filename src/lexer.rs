@@ -81,7 +81,31 @@ impl Lexer {
                 continue;
             }
 
-            // --- 2. Handle Independent Slash ---
+            // Handle compound assignment operators: +=, -=, *=, /=
+            if (c == '+' || c == '-' || c == '*' || c == '/' || c == '%')
+                && self.peek_next() == Some('=')
+            {
+                if !current_str.is_empty() {
+                    tokens.push(Token {
+                        value: current_str.clone(),
+                        span: word_start_span,
+                    });
+                    current_str.clear();
+                }
+                let op_span = Span {
+                    line: self.line,
+                    column: self.column,
+                };
+                let first = self.advance().unwrap();
+                let second = self.advance().unwrap();
+                tokens.push(Token {
+                    value: format!("{}{}", first, second),
+                    span: op_span,
+                });
+                continue;
+            }
+
+            // Handle Independent Slash
             if c == '/' {
                 let slash_span = Span {
                     line: self.line,
@@ -95,7 +119,7 @@ impl Lexer {
                 continue;
             }
 
-            // --- 3. Handle Ignored Whitespace ---
+            // Handle Ignored Whitespace
             if ignored_chars.contains(&c) {
                 if !current_str.is_empty() {
                     tokens.push(Token {
@@ -128,6 +152,13 @@ impl Lexer {
                 string_literal.push(quote_char);
 
                 while let Some(inner_c) = self.peek() {
+                    if inner_c == '\\' {
+                        string_literal.push(self.advance().unwrap());
+                        if let Some(escaped) = self.advance() {
+                            string_literal.push(escaped);
+                        }
+                        continue;
+                    }
                     if inner_c == quote_char {
                         break;
                     }

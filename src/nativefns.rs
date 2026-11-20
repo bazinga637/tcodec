@@ -31,6 +31,9 @@ pub fn get_native_registry() -> HashMap<String, NativeFn> {
         "ord" => native_ord,
         "randint" => native_randint,
         "randflt" => native_randflt,
+        "int" => native_int,
+        "float" => native_float,
+        "string" => native_string,
     }
 
     registry
@@ -52,7 +55,7 @@ fn stringify_value(val: &RuntimeValue) -> String {
     match val {
         RuntimeValue::Int(n) => n.to_string(),
         RuntimeValue::Float(n) => n.to_string(),
-        RuntimeValue::String(s) => s.clone(),
+        RuntimeValue::String(s) => s.as_ref().clone(),
         RuntimeValue::Boolean(b) => b.to_string(),
         RuntimeValue::Nil => "nil".to_string(),
         RuntimeValue::Array(list_ptr) => {
@@ -100,7 +103,7 @@ fn native_readline(_args: &[RuntimeValue]) -> RuntimeValue {
             // Rust's read_line keeps the trailing '\n' or '\r\n'.
             // We use .trim_end() to strip it off so it's a clean string.
             let clean_input = input.trim_end().to_string();
-            RuntimeValue::String(clean_input)
+            RuntimeValue::String(Rc::new(clean_input))
         }
         Err(_) => {
             // Fallback placeholder if reading input fails (e.g., EOF reached)
@@ -127,8 +130,8 @@ fn native_split(args: &[RuntimeValue]) -> RuntimeValue {
         (RuntimeValue::String(target), RuntimeValue::String(delimiter)) => {
             // Split the target string by the delimiter and convert segments to RuntimeValue::String
             let segments: Vec<RuntimeValue> = target
-                .split(delimiter)
-                .map(|s| RuntimeValue::String(s.to_string()))
+                .split(delimiter.as_str())
+                .map(|s| RuntimeValue::String(Rc::new(s.to_string())))
                 .collect();
 
             RuntimeValue::Array(Rc::new(RefCell::new(segments)))
@@ -181,13 +184,13 @@ fn native_panic(args: &[RuntimeValue]) -> RuntimeValue {
 
 fn native_type(args: &[RuntimeValue]) -> RuntimeValue {
     match args.first() {
-        Some(RuntimeValue::Int(_)) => RuntimeValue::String("int".to_string()),
-        Some(RuntimeValue::Float(_)) => RuntimeValue::String("float".to_string()),
-        Some(RuntimeValue::String(_)) => RuntimeValue::String("string".to_string()),
-        Some(RuntimeValue::Boolean(_)) => RuntimeValue::String("boolean".to_string()),
-        Some(RuntimeValue::Array(_)) => RuntimeValue::String("array".to_string()),
-        Some(RuntimeValue::Nil) => RuntimeValue::String("nil".to_string()),
-        Some(RuntimeValue::Error(_)) => RuntimeValue::String("error".to_string()),
+        Some(RuntimeValue::Int(_)) => RuntimeValue::String(Rc::new("int".to_string())),
+        Some(RuntimeValue::Float(_)) => RuntimeValue::String(Rc::new("float".to_string())),
+        Some(RuntimeValue::String(_)) => RuntimeValue::String(Rc::new("string".to_string())),
+        Some(RuntimeValue::Boolean(_)) => RuntimeValue::String(Rc::new("boolean".to_string())),
+        Some(RuntimeValue::Array(_)) => RuntimeValue::String(Rc::new("array".to_string())),
+        Some(RuntimeValue::Nil) => RuntimeValue::String(Rc::new("nil".to_string())),
+        Some(RuntimeValue::Error(_)) => RuntimeValue::String(Rc::new("error".to_string())),
         None => error!("Runtime Error: Function 'type()' expects 1 argument, found 0."),
     }
 }
@@ -243,7 +246,7 @@ fn native_chr(args: &[RuntimeValue]) -> RuntimeValue {
         Some(RuntimeValue::Int(n)) => {
             let code = *n as u32;
             match char::from_u32(code) {
-                Some(c) => RuntimeValue::String(c.to_string()),
+                Some(c) => RuntimeValue::String(Rc::new(c.to_string())),
                 None => error!(
                     "Function 'chr()' value ",
                     code, " is not a valid Unicode scalar."
@@ -328,5 +331,50 @@ fn native_randflt(args: &[RuntimeValue]) -> RuntimeValue {
         _ => error!(
             "Function 'randflt()' expects either 0 arguments or 2 <number> arguments (min, max)."
         ),
+    }
+}
+
+fn native_int(args: &[RuntimeValue]) -> RuntimeValue {
+    match args.first() {
+        Some(RuntimeValue::Int(n)) => RuntimeValue::Int(*n),
+        Some(RuntimeValue::Float(n)) => RuntimeValue::Int(*n as i32),
+        Some(RuntimeValue::Boolean(b)) => RuntimeValue::Int(if *b { 1 } else { 0 }),
+        Some(RuntimeValue::String(s)) => {
+            let trimmed = s.trim();
+            if let Ok(n) = trimmed.parse::<i32>() {
+                RuntimeValue::Int(n)
+            } else if let Ok(f) = trimmed.parse::<f64>() {
+                RuntimeValue::Int(f as i32)
+            } else {
+                error!(
+                    "Function 'int()' could not parse string '",
+                    s, "' as an <int>."
+                )
+            }
+        }
+        _ => error!("Function 'int()' expects a <number>, <bool>, or numeric <string> argument."),
+    }
+}
+
+fn native_float(args: &[RuntimeValue]) -> RuntimeValue {
+    match args.first() {
+        Some(RuntimeValue::Float(n)) => RuntimeValue::Float(*n),
+        Some(RuntimeValue::Int(n)) => RuntimeValue::Float(*n as f64),
+        Some(RuntimeValue::Boolean(b)) => RuntimeValue::Float(if *b { 1.0 } else { 0.0 }),
+        Some(RuntimeValue::String(s)) => match s.trim().parse::<f64>() {
+            Ok(f) => RuntimeValue::Float(f),
+            Err(_) => error!(
+                "Function 'float()' could not parse string '",
+                s, "' as a <float>."
+            ),
+        },
+        _ => error!("Function 'float()' expects a <number>, <bool>, or numeric <string> argument."),
+    }
+}
+
+fn native_string(args: &[RuntimeValue]) -> RuntimeValue {
+    match args.first() {
+        Some(val) => RuntimeValue::String(Rc::new(stringify_value(val))),
+        None => error!("Function 'string()' expects 1 argument, found 0."),
     }
 }

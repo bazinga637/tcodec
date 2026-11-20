@@ -1,5 +1,6 @@
 use crate::interpreter::RuntimeValue;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 // The method type signature alias
 pub type NativeMethodFn = fn(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue;
@@ -91,7 +92,7 @@ fn method_get(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue {
                     );
                 }
                 let target_char = source_str.chars().nth(idx).unwrap().to_string();
-                RuntimeValue::String(target_char)
+                RuntimeValue::String(Rc::new(target_char))
             }
             _ => error!("Method '.get()' can only be called on <array> or <string> types."),
         }
@@ -171,7 +172,9 @@ fn method_pop(obj: &RuntimeValue, _args: &[RuntimeValue]) -> RuntimeValue {
 
 fn method_trim(obj: &RuntimeValue, _args: &[RuntimeValue]) -> RuntimeValue {
     match obj {
-        RuntimeValue::String(source_str) => RuntimeValue::String(source_str.trim().to_string()),
+        RuntimeValue::String(source_str) => {
+            RuntimeValue::String(Rc::new(source_str.trim().to_string()))
+        }
         _ => error!("Method '.trim()' can only be called on a <string> type."),
     }
 }
@@ -181,7 +184,9 @@ fn method_starts_with(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue
         return error!("Method '.starts_with()' requires a <string> prefix argument.");
     };
     match obj {
-        RuntimeValue::String(source_str) => RuntimeValue::Boolean(source_str.starts_with(prefix)),
+        RuntimeValue::String(source_str) => {
+            RuntimeValue::Boolean(source_str.starts_with(prefix.as_str()))
+        }
         _ => {
             error!("Method '.starts_with()' can only be called on a <string> type.")
         }
@@ -193,7 +198,9 @@ fn method_ends_with(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue {
         return error!("Method '.ends_with()' requires a <string> suffix argument.");
     };
     match obj {
-        RuntimeValue::String(source_str) => RuntimeValue::Boolean(source_str.ends_with(suffix)),
+        RuntimeValue::String(source_str) => {
+            RuntimeValue::Boolean(source_str.ends_with(suffix.as_str()))
+        }
         _ => error!("Method '.ends_with()' can only be called on a <string> type."),
     }
 }
@@ -219,7 +226,7 @@ fn method_join(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue {
                     _ => result_string.push_str("[object]"),
                 }
             }
-            RuntimeValue::String(result_string)
+            RuntimeValue::String(Rc::new(result_string))
         }
         _ => error!("Method '.join()' can only be called on an <array> type."),
     }
@@ -255,7 +262,7 @@ fn method_contains(obj: &RuntimeValue, args: &[RuntimeValue]) -> RuntimeValue {
     match obj {
         RuntimeValue::String(source_str) => {
             if let RuntimeValue::String(search_target) = target {
-                RuntimeValue::Boolean(source_str.contains(search_target))
+                RuntimeValue::Boolean(source_str.contains(search_target.as_str()))
             } else {
                 error!("Method '.contains()' on a <string> requires a <string> target argument.")
             }

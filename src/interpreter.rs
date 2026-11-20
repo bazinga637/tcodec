@@ -1,6 +1,7 @@
 use crate::generator::OpCode;
 use crate::lexer::Span;
 use crate::nativefns::NativeFn;
+use crate::parser::CompoundOperator;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,13 +15,14 @@ pub struct Interpreter {
     native_methods: HashMap<String, crate::nativemthds::NativeMethodFn>,
     pub user_functions: HashMap<String, usize>,
     pub current_span: Span,
+    frame_pool: Vec<Vec<RuntimeValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeValue {
     Int(i32),
     Float(f64),
-    String(String),
+    String(Rc<String>),
     Boolean(bool),
     Array(Rc<RefCell<Vec<RuntimeValue>>>),
     Nil,
@@ -56,15 +58,19 @@ impl Interpreter {
             locals: vec![RuntimeValue::Nil; 256],
         };
 
+        let mut frames = Vec::with_capacity(64);
+        frames.push(global_frame);
+
         Self {
             bytecode,
             ip: 0,
-            stack: Vec::new(),
-            frames: vec![global_frame],
+            stack: Vec::with_capacity(256),
+            frames,
             natives,
             native_methods,
             user_functions,
             current_span: Span { line: 1, column: 1 },
+            frame_pool: Vec::with_capacity(64),
         }
     }
 
@@ -83,16 +89,16 @@ impl Interpreter {
         }
 
         while self.ip < self.bytecode.len() {
-            let op = self.bytecode[self.ip].clone();
+            let ip = self.ip;
             self.ip += 1;
 
-            match op {
-                OpCode::LineUpdate(span) => self.current_span = span,
+            match &self.bytecode[ip] {
+                OpCode::LineUpdate(span) => self.current_span = *span,
 
-                OpCode::PushInt(n) => self.stack.push(RuntimeValue::Int(n)),
-                OpCode::PushFloat(n) => self.stack.push(RuntimeValue::Float(n)),
-                OpCode::PushString(s) => self.stack.push(RuntimeValue::String(s)),
-                OpCode::PushBoolean(b) => self.stack.push(RuntimeValue::Boolean(b)),
+                OpCode::PushInt(n) => self.stack.push(RuntimeValue::Int(*n)),
+                OpCode::PushFloat(n) => self.stack.push(RuntimeValue::Float(*n)),
+                OpCode::PushString(s) => self.stack.push(RuntimeValue::String(Rc::clone(s))),
+                OpCode::PushBoolean(b) => self.stack.push(RuntimeValue::Boolean(*b)),
                 OpCode::PushNil => self.stack.push(RuntimeValue::Nil),
 
                 OpCode::GetLocal(slot) => {
@@ -100,7 +106,7 @@ impl Interpreter {
                         .frames
                         .last()
                         .ok_or("Interpreter Error: No active frame")?;
-                    let val = current_frame.locals[slot].clone();
+                    let val = current_frame.locals[*slot].clone();
                     self.stack.push(val);
                 }
 
@@ -111,7 +117,7 @@ impl Interpreter {
                         .ok_or("Interpreter Error: SetLocal stack underflow")?;
                     let current_frame =
                         self.frames.last_mut().ok_or("VM Error: No active frame")?;
-                    current_frame.locals[slot] = val;
+                    current_frame.locals[*slot] = val;
                 }
 
                 OpCode::GetIndex => {
@@ -151,7 +157,58 @@ impl Interpreter {
                         }
                         RuntimeValue::String(s) => {
                             if let Some(ch) = s.chars().nth(idx) {
-                                self.stack.push(RuntimeValue::String(ch.to_string()));
+                                self.stack
+                                    .push(RuntimeValue::String(Rc::new(ch.to_string())));
+                            } else {
+                                return error!(
+                                    "Runtime Error: <string> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    s.chars().count()
+                                );
+                            }
+                        }
+                        _ => return error!("Runtime Error: Cannot index into this type."),
+                    }
+                }
+
+                OpCode::GetLocalIndex(slot) => {
+                    let index_val = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing index operand")?;
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Index must be an <int>.");
+                    };
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+                    let current_frame = self
+                        .frames
+                        .last()
+                        .ok_or("Interpreter Error: No active frame")?;
+
+                    match &current_frame.locals[*slot] {
+                        RuntimeValue::Array(list_ptr) => {
+                            let list = list_ptr.borrow();
+                            if idx >= list.len() {
+                                return error!(
+                                    "Runtime Error: <array> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    list.len()
+                                );
+                            }
+                            self.stack.push(list[idx].clone());
+                        }
+                        RuntimeValue::String(s) => {
+                            if let Some(ch) = s.chars().nth(idx) {
+                                self.stack
+                                    .push(RuntimeValue::String(Rc::new(ch.to_string())));
                             } else {
                                 return error!(
                                     "Runtime Error: <string> index ",
@@ -208,6 +265,134 @@ impl Interpreter {
                             return error!(
                             "Runtime Error: Index assignment is only supported on <array> types."
                         )
+                        }
+                    }
+                }
+
+                OpCode::SetLocalIndex(slot) => {
+                    let value = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing value for index assignment")?;
+                    let index_val = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing index for index assignment")?;
+
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Array index must be an <int>.");
+                    };
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+                    let current_frame = self.frames.last().ok_or("VM Error: No active frame")?;
+
+                    match &current_frame.locals[*slot] {
+                        RuntimeValue::Array(list_ptr) => {
+                            let mut list = list_ptr.borrow_mut();
+                            if idx >= list.len() {
+                                return error!(
+                                    "Runtime Error: <array> index ",
+                                    idx,
+                                    " is out of bounds for length ",
+                                    list.len()
+                                );
+                            }
+                            list[idx] = value;
+                        }
+                        _ => {
+                            return error!(
+                            "Runtime Error: Index assignment is only supported on <array> types."
+                        )
+                        }
+                    }
+                }
+
+                OpCode::CompoundAssignLocalIndex(slot, op) => {
+                    let rhs = self.stack.pop().ok_or("Interpreter Error: Missing value")?;
+                    let index_val = self.stack.pop().ok_or("Interpreter Error: Missing index")?;
+
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Array index must be an <int>.");
+                    };
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+                    let current_frame = self.frames.last().ok_or("VM Error: No active frame")?;
+
+                    let RuntimeValue::Array(list_ptr) = &current_frame.locals[*slot] else {
+                        return error!("Runtime Error: Compound index assignment is only supported on <array> types.");
+                    };
+                    let mut list = list_ptr.borrow_mut();
+                    if idx >= list.len() {
+                        return error!(
+                            "Runtime Error: <array> index ",
+                            idx,
+                            " is out of bounds for length ",
+                            list.len()
+                        );
+                    }
+
+                    match (op, &mut list[idx], rhs) {
+                        (
+                            CompoundOperator::Add,
+                            RuntimeValue::String(a),
+                            RuntimeValue::String(b),
+                        ) => {
+                            Rc::make_mut(a).push_str(&b);
+                        }
+                        (CompoundOperator::Add, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a += b
+                        }
+                        (CompoundOperator::Sub, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a -= b
+                        }
+                        (CompoundOperator::Mul, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a *= b
+                        }
+                        (CompoundOperator::Div, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a /= b;
+                        }
+                        (CompoundOperator::Mod, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a %= b
+                        }
+                        (op, elem, rhs_val) => {
+                            if let (Some(a), Some(b)) = (elem.to_f64(), rhs_val.to_f64()) {
+                                let res = match op {
+                                    CompoundOperator::Add => a + b,
+                                    CompoundOperator::Sub => a - b,
+                                    CompoundOperator::Mul => a * b,
+                                    CompoundOperator::Div => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a / b
+                                    }
+                                    CompoundOperator::Mod => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a % b
+                                    }
+                                };
+                                *elem = RuntimeValue::Float(res);
+                            } else {
+                                return error!("Runtime Error: Invalid operand types for compound index assignment.");
+                            }
                         }
                     }
                 }
@@ -270,10 +455,19 @@ impl Interpreter {
                         (RuntimeValue::Float(a), RuntimeValue::Int(b)) => {
                             self.stack.push(RuntimeValue::Float(a + b as f64))
                         }
-                        (RuntimeValue::String(mut a), RuntimeValue::String(b)) => {
-                            a.push_str(&b);
-                            self.stack.push(RuntimeValue::String(a));
+                        (RuntimeValue::String(a), RuntimeValue::String(b)) => {
+                            let mut owned = match Rc::try_unwrap(a) {
+                                Ok(s) => s,
+                                Err(shared) => {
+                                    let mut s = String::with_capacity(shared.len() + b.len() + 32);
+                                    s.push_str(&shared);
+                                    s
+                                }
+                            };
+                            owned.push_str(&b);
+                            self.stack.push(RuntimeValue::String(Rc::new(owned)));
                         }
+
                         _ => {
                             return error!(
                                 "Runtime Error: Invalid operand profiles for binary addition (+)."
@@ -326,11 +520,10 @@ impl Interpreter {
                             return error!("Runtime Error: Division by zero.");
                         }
                         if let (RuntimeValue::Int(ai), RuntimeValue::Int(bi)) = (&l, &r) {
-                            if ai % bi == 0 {
-                                self.stack.push(RuntimeValue::Int(ai / bi));
-                            } else {
-                                self.stack.push(RuntimeValue::Float(a / b));
+                            if *bi == 0 {
+                                return error!("Runtime Error: Division by zero.");
                             }
+                            self.stack.push(RuntimeValue::Int(ai / bi));
                         } else {
                             self.stack.push(RuntimeValue::Float(a / b));
                         }
@@ -338,6 +531,195 @@ impl Interpreter {
                         return error!(
                             "Runtime Error: Invalid operand profiles for binary division (/)."
                         );
+                    }
+                }
+
+                OpCode::Mod => {
+                    let r = self.stack.pop().unwrap();
+                    let l = self.stack.pop().unwrap();
+                    if let (RuntimeValue::Int(ai), RuntimeValue::Int(bi)) = (&l, &r) {
+                        if *bi == 0 {
+                            return error!("Runtime Error: Division by zero.");
+                        }
+                        self.stack.push(RuntimeValue::Int(ai % bi));
+                    } else if let (Some(a), Some(b)) = (l.to_f64(), r.to_f64()) {
+                        if b == 0.0 {
+                            return error!("Runtime Error: Division by zero.");
+                        }
+                        self.stack.push(RuntimeValue::Float(a % b));
+                    } else {
+                        return error!(
+                            "Runtime Error: Invalid operand profiles for binary modulo (%)."
+                        );
+                    }
+                }
+
+                OpCode::CompoundAssignLocal(slot, op) => {
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: CompoundAssign stack underflow")?;
+                    let current_frame =
+                        self.frames.last_mut().ok_or("VM Error: No active frame")?;
+                    let lhs = &mut current_frame.locals[*slot];
+
+                    match (op, lhs, rhs) {
+                        (
+                            crate::parser::CompoundOperator::Add,
+                            RuntimeValue::String(a),
+                            RuntimeValue::String(b),
+                        ) => {
+                            Rc::make_mut(a).push_str(&b);
+                        }
+                        (
+                            crate::parser::CompoundOperator::Add,
+                            RuntimeValue::Int(a),
+                            RuntimeValue::Int(b),
+                        ) => *a += b,
+                        (
+                            crate::parser::CompoundOperator::Sub,
+                            RuntimeValue::Int(a),
+                            RuntimeValue::Int(b),
+                        ) => *a -= b,
+                        (
+                            crate::parser::CompoundOperator::Mul,
+                            RuntimeValue::Int(a),
+                            RuntimeValue::Int(b),
+                        ) => *a *= b,
+                        (
+                            crate::parser::CompoundOperator::Div,
+                            RuntimeValue::Int(a),
+                            RuntimeValue::Int(b),
+                        ) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a /= b;
+                        }
+                        (
+                            crate::parser::CompoundOperator::Mod,
+                            RuntimeValue::Int(a),
+                            RuntimeValue::Int(b),
+                        ) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a %= b
+                        }
+                        (op, target, rhs_val) => {
+                            if let (Some(a), Some(b)) = (target.to_f64(), rhs_val.to_f64()) {
+                                let res = match op {
+                                    crate::parser::CompoundOperator::Add => a + b,
+                                    crate::parser::CompoundOperator::Sub => a - b,
+                                    crate::parser::CompoundOperator::Mul => a * b,
+                                    crate::parser::CompoundOperator::Div => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a / b
+                                    }
+                                    CompoundOperator::Mod => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a % b
+                                    }
+                                };
+                                *target = RuntimeValue::Float(res);
+                            } else {
+                                return error!(
+                                    "Runtime Error: Invalid operand types for compound assignment."
+                                );
+                            }
+                        }
+                    }
+                }
+
+                OpCode::CompoundAssignIndex(op) => {
+                    let rhs = self.stack.pop().ok_or("Interpreter Error: Missing value")?;
+                    let index_val = self.stack.pop().ok_or("Interpreter Error: Missing index")?;
+                    let target = self
+                        .stack
+                        .pop()
+                        .ok_or("Interpreter Error: Missing target")?;
+
+                    let RuntimeValue::Int(idx_int) = index_val else {
+                        return error!("Runtime Error: Array index must be an <int>.");
+                    };
+                    if idx_int < 0 {
+                        return error!(
+                            "Runtime Error: Negative index ",
+                            idx_int, " is out of bounds."
+                        );
+                    }
+                    let idx = idx_int as usize;
+
+                    let RuntimeValue::Array(list_ptr) = target else {
+                        return error!("Runtime Error: Compound index assignment is only supported on <array> types.");
+                    };
+                    let mut list = list_ptr.borrow_mut();
+                    if idx >= list.len() {
+                        return error!(
+                            "Runtime Error: <array> index ",
+                            idx,
+                            " is out of bounds for length ",
+                            list.len()
+                        );
+                    }
+
+                    match (op, &mut list[idx], rhs) {
+                        (
+                            CompoundOperator::Add,
+                            RuntimeValue::String(a),
+                            RuntimeValue::String(b),
+                        ) => {
+                            Rc::make_mut(a).push_str(&b);
+                        }
+                        (CompoundOperator::Add, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a += b
+                        }
+                        (CompoundOperator::Sub, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a -= b
+                        }
+                        (CompoundOperator::Mul, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            *a *= b
+                        }
+                        (CompoundOperator::Div, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a /= b;
+                        }
+                        (CompoundOperator::Mod, RuntimeValue::Int(a), RuntimeValue::Int(b)) => {
+                            if b == 0 {
+                                return error!("Runtime Error: Division by zero.");
+                            }
+                            *a %= b
+                        }
+                        (op, elem, rhs_val) => {
+                            if let (Some(a), Some(b)) = (elem.to_f64(), rhs_val.to_f64()) {
+                                let res = match op {
+                                    CompoundOperator::Add => a + b,
+                                    CompoundOperator::Sub => a - b,
+                                    CompoundOperator::Mul => a * b,
+                                    CompoundOperator::Div => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a / b
+                                    }
+                                    CompoundOperator::Mod => {
+                                        if b == 0.0 {
+                                            return error!("Runtime Error: Division by zero.");
+                                        }
+                                        a % b
+                                    }
+                                };
+                                *elem = RuntimeValue::Float(res);
+                            } else {
+                                return error!("Runtime Error: Invalid operand types for compound index assignment.");
+                            }
+                        }
                     }
                 }
 
@@ -390,7 +772,12 @@ impl Interpreter {
                         .stack
                         .pop()
                         .ok_or("Interpreter Error: Equal left operand missing")?;
-                    self.stack.push(RuntimeValue::Boolean(l == r));
+                    let is_eq = match (&l, &r) {
+                        (RuntimeValue::Int(a), RuntimeValue::Float(b)) => (*a as f64) == *b,
+                        (RuntimeValue::Float(a), RuntimeValue::Int(b)) => *a == (*b as f64),
+                        _ => l == r,
+                    };
+                    self.stack.push(RuntimeValue::Boolean(is_eq));
                 }
 
                 OpCode::NotEqual => {
@@ -402,7 +789,12 @@ impl Interpreter {
                         .stack
                         .pop()
                         .ok_or("Interpreter Error: NotEqual left operand missing")?;
-                    self.stack.push(RuntimeValue::Boolean(l != r));
+                    let is_eq = match (&l, &r) {
+                        (RuntimeValue::Int(a), RuntimeValue::Float(b)) => (*a as f64) == *b,
+                        (RuntimeValue::Float(a), RuntimeValue::Int(b)) => *a == (*b as f64),
+                        _ => l == r,
+                    };
+                    self.stack.push(RuntimeValue::Boolean(!is_eq));
                 }
 
                 OpCode::And => {
@@ -445,7 +837,7 @@ impl Interpreter {
 
                 OpCode::BuildArray(count) => {
                     let mut items = Vec::new();
-                    for _ in 0..count {
+                    for _ in 0..*count {
                         items.push(self.stack.pop().unwrap());
                     }
                     items.reverse();
@@ -456,7 +848,7 @@ impl Interpreter {
 
                 OpCode::CallMethod { name, arg_count } => {
                     let mut args = Vec::new();
-                    for _ in 0..arg_count {
+                    for _ in 0..*arg_count {
                         args.push(
                             self.stack
                                 .pop()
@@ -470,7 +862,7 @@ impl Interpreter {
                         .pop()
                         .ok_or("Interpreter Error: Missing object context")?;
 
-                    if let Some(method_fn) = self.native_methods.get(&name) {
+                    if let Some(method_fn) = self.native_methods.get(name.as_str()) {
                         let result = method_fn(&obj, &args);
                         self.stack.push(result);
                     } else {
@@ -481,7 +873,7 @@ impl Interpreter {
                 }
 
                 OpCode::Jump(target) => {
-                    self.ip = target;
+                    self.ip = *target;
                 }
 
                 OpCode::JumpIfFalse(target) => {
@@ -490,21 +882,21 @@ impl Interpreter {
                         .pop()
                         .ok_or("Interpreter Error: Missing jump condition")?;
                     if let RuntimeValue::Boolean(false) = condition {
-                        self.ip = target;
+                        self.ip = *target;
                     }
                 }
 
                 OpCode::CallFunction { name, arg_count } => {
-                    if let Some(native_fn) = self.natives.get(&name) {
+                    if let Some(native_fn) = self.natives.get(name.as_str()) {
                         let mut args = Vec::new();
-                        for _ in 0..arg_count {
+                        for _ in 0..*arg_count {
                             args.push(self.stack.pop().unwrap());
                         }
                         args.reverse();
                         let result = native_fn(&args);
                         self.stack.push(result);
                     } else {
-                        let function_entry_address = match self.user_functions.get(&name) {
+                        let function_entry_address = match self.user_functions.get(name.as_str()) {
                             Some(&addr) => addr,
                             None => {
                                 return error!(
@@ -513,10 +905,12 @@ impl Interpreter {
                             }
                         };
 
-                        let mut local_workspace = vec![RuntimeValue::Nil; 256];
+                        let mut local_workspace = self
+                            .frame_pool
+                            .pop()
+                            .unwrap_or_else(|| vec![RuntimeValue::Nil; 256]);
 
-                        // Ensure right-to-left popping places the first parameter at index 0
-                        for i in (0..arg_count).rev() {
+                        for i in (0..*arg_count).rev() {
                             local_workspace[i] = self
                                 .stack
                                 .pop()
@@ -544,15 +938,14 @@ impl Interpreter {
                         .ok_or("Interpreter Error: Return statement stack underflow")?;
 
                     // Pop the completed function frame off our call stack to restore the caller's layout
-                    let completed_frame = self
+                    let mut completed_frame = self
                         .frames
                         .pop()
                         .ok_or("Interpreter Error: Frame stack underflow")?;
 
-                    // Teleport our instruction pointer back to exactly where the caller left off
                     self.ip = completed_frame.return_address;
-
-                    // Push the return value BACK onto the stack so the caller frame can read it
+                    completed_frame.locals.fill(RuntimeValue::Nil);
+                    self.frame_pool.push(completed_frame.locals);
                     self.stack.push(return_value);
                 }
             }
